@@ -14,9 +14,14 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import re
 import shlex
+import sys
+import tempfile
 from pathlib import Path
+from urllib.error import URLError
+from urllib.request import Request, urlopen
 
 import openpyxl
 from openpyxl.comments import Comment
@@ -33,6 +38,58 @@ COL_HDR = PatternFill("solid", fgColor="E8F1FF")
 EST = PatternFill("solid", fgColor="E8F8E8")
 WARN = PatternFill("solid", fgColor="FCE8E6")
 MEAS = PatternFill("solid", fgColor="D6EAF8")  # measured (from log)
+
+
+# ---------- HuggingFace config.json auto-download ----------
+# Resolves a HF model id (e.g. "MiniMaxAI/MiniMax-M3") or HF URL to a local
+# config.json path. Downloads ONLY config.json (a few KB), never weights.
+# Falls back through text_config variants for VL models. No huggingface_hub
+# dependency required — uses plain urllib so the skill stays self-contained.
+HF_ENDPOINT = os.environ.get("HF_ENDPOINT", "https://huggingface.co")
+HF_TOKEN = os.environ.get("HF_TOKEN") or os.environ.get("HUGGING_FACE_HUB_TOKEN")
+
+
+def _hf_resolve_id(s: str) -> str:
+    """Accept 'owner/name', 'owner/name/revision', or a full HF URL; return 'owner/name' (+ optional revision)."""
+    s = s.strip()
+    if s.startswith(("http://", "https://")):
+        # https://huggingface.co/owner/name[/resolve/main/config.json][/tree/main]
+        m = re.match(r"https?://[^/]+/([^/]+/[^/?#]+)(?:/(?:resolve|blob|tree)/([^/?#]+))?", s)
+        if m:
+            return m.group(1) + (f"@{m.group(2)}" if m.group(2) else "")
+    return s
+
+
+def _hf_download_config(model_id: str, dest_dir: Path) -> Path:
+    """Download config.json for a HF model id into dest_dir; return local path."""
+    dest_dir.mkdir(parents=True, exist_ok=True)
+    safe = model_id.replace("/", "_").replace("@", "_rev_")
+    out = dest_dir / f"{safe}__config.json"
+    if out.exists() and out.stat().st_size > 0:
+        return out  # cache
+    mid, _, rev = model_id.partition("@")
+    rev = rev or "main"
+    url = f"{HF_ENDPOINT}/{mid}/resolve/{rev}/config.json"
+    headers = {"User-Agent": "ascend-memory-table/1.0"}
+    if HF_TOKEN:
+        headers["Authorization"] = f"Bearer {HF_TOKEN}"
+    req = Request(url, headers=headers)
+    try:
+        with urlopen(req, timeout=30) as r:
+            data = r.read()
+    except URLError as e:
+        sys.exit(
+            f"[fill_table] 下载 config.json 失败: {url}\n"
+            f"  原因: {e}\n"
+            f"  排查: 1) 模型 id 是否正确 2) 是否需要登录(设置 HF_TOKEN 环境变量) "
+            f"3) 私有/ gated 仓库需先 huggingface-cli login 4) 国内可设 HF_ENDPOINT=https://hf-mirror.com"
+        )
+    try:
+        json.loads(data)  # validate
+    except json.JSONDecodeError:
+        sys.exit(f"[fill_table] 下载的内容不是合法 JSON: {url}")
+    out.write_bytes(data)
+    return out
 
 
 # ---------- serve command parsing ----------
@@ -262,35 +319,68 @@ def fill_xlsx(template_path: Path, out_path: Path, model_name: str, a: dict,
 
 
 def main():
-    ap = argparse.ArgumentParser(description="Ascend NPU 显存填表")
-    ap.add_argument("--config", help="config.json 路径")
-    ap.add_argument("--config-dir", help="含 config.json 的模型目录")
+    ap = argparse.ArgumentParser(
+        description="Ascend NPU 显存填表（无需本地 vllm/vllm-ascend 源码；公式已内置）",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="""\
+示例:
+  # 1) 只给 HF model id（自动下载 config.json，无需本地任何模型文件）
+  python fill_table.py --hf-model MiniMaxAI/MiniMax-M3 \\
+    --serve "vllm serve MiniMaxAI/MiniMax-M3 --tensor-parallel-size 8 --gpu-memory-utilization 0.9 --max-model-len 65536 --quantization ascend --enable-expert-parallel"
+
+  # 2) 本地 config.json
+  python fill_table.py --config /path/to/config.json --serve "vllm serve ..." --hbm 96
+
+  # 3) 只算不写表（dry-run，快速看结果）
+  python fill_table.py --hf-model Qwen/Qwen3-235B-A22B --serve "..." --dry-run
+
+  # 4) 带 warmup 日志（实测值覆盖理论占位）
+  python fill_table.py --config config.json --serve "..." --warmup-log vllm.log
+""",
+    )
+    src = ap.add_argument_group("模型来源（三选一）")
+    src.add_argument("--hf-model", help="HuggingFace model id 或 URL（如 MiniMaxAI/MiniMax-M3）；自动下载 config.json，无需权重")
+    src.add_argument("--config", help="本地 config.json 路径")
+    src.add_argument("--config-dir", help="含 config.json 的模型目录")
     ap.add_argument("--serve", required=True, help="vllm serve / api_server 拉起命令字符串")
-    ap.add_argument("--model-name", default="", help="表格中显示的模型名")
-    ap.add_argument("--hbm", type=float, default=64.0, help="单卡 HBM GiB（默认64）")
-    ap.add_argument("--B", type=int, default=8192, help="平均请求长度（默认8192）")
-    ap.add_argument("--non-torch", type=float, default=3.2, help="non-torch 经验值 GiB")
-    ap.add_argument("--graph", type=float, default=2.0, help="NPU graph 经验值 GiB")
+    ap.add_argument("--model-name", default="", help="表格中显示的模型名（不给则用 HF id / 目录名）")
+    ap.add_argument("--hbm", type=float, default=64.0, help="单卡 HBM GiB（默认 64；可选 80/96）")
+    ap.add_argument("--B", type=int, default=8192, help="平均请求长度（输入+输出 tokens，默认 8192）")
+    ap.add_argument("--non-torch", type=float, default=3.2, help="non-torch 经验值 GiB（TP/DP 越大越大，默认 3.2）")
+    ap.add_argument("--graph", type=float, default=2.0, help="NPU graph 经验值 GiB（默认 2.0）")
     ap.add_argument("--warmup-log", help="vllm-ascend warmup 日志路径（可选，提供则用实测值）")
     ap.add_argument("--template", help="模板 xlsx（默认用脚本同目录 template.xlsx）")
     ap.add_argument("--out", default=None, help="输出 xlsx 路径（默认写到 skill 目录下 outputs/<模型名>-memory-table.xlsx）")
+    ap.add_argument("--dry-run", action="store_true", help="只计算并打印结果，不写 xlsx")
     args = ap.parse_args()
 
-    cfg_path = Path(args.config) if args.config else (Path(args.config_dir) / "config.json")
+    # ---- resolve config.json source ----
+    if not args.hf_model and not args.config and not args.config_dir:
+        sys.exit("[fill_table] 必须提供模型来源之一：--hf-model / --config / --config-dir")
+
+    if args.hf_model:
+        model_id = _hf_resolve_id(args.hf_model)
+        tmp_dir = Path(tempfile.gettempdir()) / "ascend-mem-table"
+        cfg_path = _hf_download_config(model_id, tmp_dir)
+        default_name = model_id.split("@", 1)[0].split("/", 1)[-1]
+    else:
+        cfg_path = Path(args.config) if args.config else Path(args.config_dir) / "config.json"
+        if not cfg_path.exists():
+            sys.exit(f"[fill_table] config.json 不存在: {cfg_path}")
+        default_name = cfg_path.parent.name
+
     cfg = load_config(cfg_path)
     a = arch_from_config(cfg)
     deploy = parse_serve(args.serve)
     if not deploy["max_model_len"]:
-        deploy["max_model_len"] = a.get("L", 8192)  # fallback
+        # fall back to config max_position_embeddings if serve didn't specify
+        mpe = cfg["text"].get("max_position_embeddings") or cfg["text"].get("seq_length")
+        deploy["max_model_len"] = mpe or 8192
+        print(f"[fill_table] 未在拉起命令中找到 --max-model-len，回退到 {deploy['max_model_len']}")
     if not deploy["max_num_batched_tokens"]:
         deploy["max_num_batched_tokens"] = deploy["max_model_len"]
-    name = args.model_name or cfg_path.parent.name
-    # 默认输出到 skill 目录下的 outputs/ 子文件夹，避免污染 skill 结构
-    if args.out:
-        out_path = Path(args.out)
-    else:
-        out_path = Path(__file__).resolve().parent.parent / "outputs" / f"{name}-memory-table.xlsx"
-    out_path.parent.mkdir(parents=True, exist_ok=True)
+    name = args.model_name or default_name
+
     quant = deploy.get("quantization") or ""
     is_w8a8 = quant.lower() in ("ascend", "w8a8")
     wbk = estimate_weights(a, deploy["TP"], deploy["EP"], quant)
@@ -319,12 +409,42 @@ def main():
             gpu_tokens = measured["gpu_kv_tokens"]
         if "max_concurrency" in measured:
             max_conc = measured["max_concurrency"]
+
+    cur_kv = round(budget.current_kv_gib(), 3)
+    print(f"模型: {name}")
+    print(f"  L={a['L']} L_sparse={a['L_sparse']} Hkv={a['Hkv']} D={a['D']} IdxD={a['IdxD']} "
+          f"hidden={a['hidden_size']} experts={a['num_experts']} topk={a['num_experts_per_tok']}")
+    print(f"  部署: TP={deploy['TP']} DP={deploy['DP']} EP={deploy['EP']} util={deploy['util']} "
+          f"max_model_len={deploy['max_model_len']} block_size={deploy['block_size']} quant={quant or 'BF16'} kv_dtype_bpe={bpe}")
+    print(f"  Hkv_local=max(1,{a['Hkv']}//{deploy['TP']})={Hkv_local}")
+    print(f"  W8A8权重分项: " + " ".join(f"{k}={v}" for k, v in wbk.items() if k != "weight"))
+    print(f"  W={wbk['weight']}GiB  peak_act={act_b/GiB:.3f}GiB  non_torch={args.non_torch}GiB  graph={args.graph}GiB")
+    print(f"  requested={budget.requested_bytes()/GiB:.3f}GiB  CurrentKV={cur_kv}GiB  "
+          f"num_blocks={num_blocks}  blocks_per_req={blocks_per_req}")
+    print(f"  GPU_KV_tokens={gpu_tokens}  满长并发={max_conc:.4f}  "
+          f"单token合计={layout.sum_bytes_per_token/MiB:.6f}MiB "
+          f"(main={layout.main_bytes_per_token/MiB:.6f} index={layout.index_bytes_per_token/MiB:.6f})")
+    if measured:
+        print(f"  [实测] 已用 warmup 日志覆盖: {list(measured.keys())}")
+    else:
+        print(f"  [理论] 无 warmup 日志，权重/激活/non_torch/graph 为理论占位（绿底）；拉起后可用日志替换")
+
+    if args.dry_run:
+        print("[dry-run] 未写 xlsx")
+        return
+
+    # 默认输出到 skill 目录下的 outputs/ 子文件夹，避免污染 skill 结构
+    if args.out:
+        out_path = Path(args.out)
+    else:
+        out_path = Path(__file__).resolve().parent.parent / "outputs" / f"{name}-memory-table.xlsx"
+    out_path.parent.mkdir(parents=True, exist_ok=True)
     tpl = Path(args.template) if args.template else Path(__file__).parent / "template.xlsx"
+    if not tpl.exists():
+        sys.exit(f"[fill_table] 模板不存在: {tpl}（请先运行 python build_template.py 生成）")
     out = fill_xlsx(tpl, out_path, name, a, deploy, wbk, budget, layout, hybrid,
                     num_blocks, max_conc, gpu_tokens, blocks_per_req, idx_bs, measured, args.B)
     print(f"OK -> {out}")
-    print(f"  W={wbk['weight']}GiB  CurrentKV={budget.current_kv_gib():.3f}GiB  "
-          f"tokens={gpu_tokens}  满长并发={max_conc:.4f}  单token合计={layout.sum_bytes_per_token/MiB:.6f}MiB")
 
 
 if __name__ == "__main__":

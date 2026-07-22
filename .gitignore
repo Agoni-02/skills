@@ -1,0 +1,8 @@
+# Python bytecode / cache
+__pycache__/
+*.pyc
+*.pyo
+
+# 临时 / 系统
+.DS_Store
+Thumbs.db

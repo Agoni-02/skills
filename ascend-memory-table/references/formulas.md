@@ -1,5 +1,8 @@
-# 显存参数计算公式对应表（以本地 vllm / vllm-Ascend 最新代码为准）
+# 显存参数计算公式对应表（对齐 vllm / vllm-Ascend 最新代码）
 
+> **本表所有公式已内置在 `scripts/vllm_ascend_memory_formulas.py`，使用本 skill 无需本地 vllm / vllm-ascend 源码或安装包。**
+> 下列「源码位置」仅为溯源锚点，便于核对口径与未来同步上游。
+>
 > 仓库版本（已与 GitHub upstream 对齐）：
 > - `vllm` HEAD: `d6dbdb9b0` (main)
 > - `vllm-ascend` HEAD: `f5b5514af` (main)

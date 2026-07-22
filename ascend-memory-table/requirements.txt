@@ -1,0 +1,13 @@
+# ascend-memory-table 依赖
+# 该 skill 自包含，无需 vllm / vllm-ascend 源码或安装包。
+# 仅需以下两个第三方库（Python 3.8+）：
+#
+#   pip install -r requirements.txt
+#
+# 国内镜像加速：
+#   pip install -r requirements.txt -i https://pypi.tuna.tsinghua.edu.cn/simple
+
+openpyxl>=3.0.10   # 读写 .xlsx 模板与输出表格
+# requests / huggingface_hub 均非必需：
+#   - config.json 下载用标准库 urllib 实现，无需 requests
+#   - 不下载权重，无需 huggingface_hub

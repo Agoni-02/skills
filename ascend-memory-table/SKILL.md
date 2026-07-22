@@ -1,21 +1,50 @@
 ---
 name: ascend-memory-table
-description: Given a new model (HuggingFace id / local config.json / URL) and its vLLM serve command, fill a memory-analysis spreadsheet (.xlsx) matching the standard template, computing weights / activation / KV cache / num_blocks / concurrency using formulas aligned to the local vllm and vllm-ascend source code. Use when the user wants to estimate Ascend NPU per-card memory and KV concurrency for a model, says "显存填表", "参数分析表格", "拉起服务参数分析", "单卡权重估算", "KV并发估算", or provides a model + serve command and wants a filled xlsx. Trigger also when the user points to a config.json plus a vllm serve / api_server command.
+description: Given a new model (HuggingFace id / local config.json / URL) and its vLLM serve command, fill a memory-analysis spreadsheet (.xlsx) matching the standard template, computing weights / activation / KV cache / num_blocks / concurrency using formulas aligned to the vllm and vllm-ascend source code. Use when the user wants to estimate Ascend NPU per-card memory and KV concurrency for a model, says "显存填表", "参数分析表格", "拉起服务参数分析", "单卡权重估算", "KV并发估算", or provides a model + serve command and wants a filled xlsx. Trigger also when the user points to a config.json plus a vllm serve / api_server command.
 ---
 
 # Ascend NPU 显存填表
 
-为给定模型 + 拉起命令，按本地 vllm / vllm-ascend 源码口径计算显存与并发，输出与标准模板一致的 `.xlsx`。
+为给定模型 + 拉起命令，按 vllm / vllm-ascend 源码口径计算显存与并发，输出与标准模板一致的 `.xlsx`。
+
+> **自包含 skill，无需本地 vllm / vllm-ascend 源码或安装包。**
+> 所有公式已内置在 `scripts/vllm_ascend_memory_formulas.py`，源码锚点（`worker.py:581` 等）仅作溯源说明。
+> 用户只需 Python 3.8+ 和 `openpyxl`，给一个 HuggingFace model id 即可开始估算。
+
+## 前置条件
+
+- Python 3.8+
+- 安装依赖（仅 `openpyxl` 一个第三方库）：
+  ```bash
+  pip install -r <skill_dir>/requirements.txt
+  ```
+- 不需要：vllm、vllm-ascend、torch、npu 环境、模型权重文件。
+
+## 快速开始（最常见用法）
+
+```bash
+cd <skill_dir>/scripts
+python fill_table.py \
+  --hf-model MiniMaxAI/MiniMax-M3 \
+  --serve "vllm serve MiniMaxAI/MiniMax-M3 --tensor-parallel-size 8 --gpu-memory-utilization 0.9 --max-model-len 65536 --quantization ascend --enable-expert-parallel" \
+  --hbm 64 --B 8192
+# 输出: <skill_dir>/outputs/MiniMax-M3-memory-table.xlsx
+```
+
+只需 3 个输入：① 模型（`--hf-model` / `--config` / `--config-dir` 之一）② 拉起命令 ③ 单卡 HBM 容量。
 
 ## 输入
 
 用户需提供（缺一不可）：
 
 1. **模型** — 三选一：
-   - 本地 `config.json` 路径（或含它的模型目录）
-   - HuggingFace URL / model id（如 `MiniMaxAI/MiniMax-M3`）
-   - 已下载到本地的模型目录
+   - `--hf-model <HF id 或 URL>`（**推荐，最省事**）：如 `MiniMaxAI/MiniMax-M3`、`Qwen/Qwen3-235B-A22B`，脚本自动从 HF 下载 `config.json`（仅几 KB，不下载权重），缓存到系统临时目录
+   - `--config <本地 config.json 路径>`（或含它的模型目录用 `--config-dir`）
+   - 已下载到本地的模型目录（`--config-dir`）
 2. **拉起命令** — `vllm serve ...` 或 `python -m vllm.entrypoints.openai.api_server ...` 的完整命令字符串（含 `--tensor-parallel-size`、`--gpu-memory-utilization`、`--max-model-len`、`--quantization` 等参数）
+
+> 国内访问 HF 慢？设环境变量 `HF_ENDPOINT=https://hf-mirror.com` 即可走镜像。
+> 私有 / gated 模型？设 `HF_TOKEN=<your_token>`。
 
 ## 输出前先问用户要这些信息（提高准确率）
 
@@ -36,38 +65,42 @@ description: Given a new model (HuggingFace id / local config.json / URL) and it
 ### Step 1: 解析输入
 - 从拉起命令提取：TP、DP、EP（=TP×DP if `--enable-expert-parallel`）、util、max-model-len、max-num-seqs、max-num-batched-tokens、block-size、quantization、kv-cache-dtype
 - 读 `config.json` 取架构参数：L、L_sparse、Hkv、D、IdxD、hidden_size、num_experts、top-k 等
-- 若用户给 HF URL/id 且本地无 config，**下载到系统临时目录**（如 `$TEMP/ascend-mem-table/<model>/`），**不要下载到 skill 文件夹内**，避免破坏 skill 文件结构。只下 `config.json` 等小文件，不要下权重。
+- 若用户给 HF id/URL，**脚本会自动下载 `config.json` 到系统临时目录**（`$TEMP/ascend-mem-table/`），**不下载权重**，**不写入 skill 文件夹**。
+- 若拉起命令未指定 `--max-model-len`，回退到 `config.max_position_embeddings` / `seq_length`。
 
 > ⚠️ 文件卫生规则（重要）：
-> - **模型文件（config.json / 建模代码）下载到系统临时目录**，不要在 skill 目录下创建 `models/` 等过程文件夹。
+> - **模型文件（config.json）下载到系统临时目录**，不要在 skill 目录下创建 `models/` 等过程文件夹。
 > - **临时 runner 脚本**（用于绕开 shell 引号问题的 `python -c` 包装）写到系统临时目录，用完即删，**不要留在 `scripts/`**。
 > - **输出 xlsx 统一写到 `outputs/` 子文件夹**（脚本默认行为，无需手动指定 `--out`）。
-> - skill 目录应始终保持只有：`SKILL.md`、`references/`、`scripts/`（4 个固定文件）、`outputs/`。
+> - skill 目录应始终保持只有：`SKILL.md`、`requirements.txt`、`references/`、`scripts/`（固定文件）、`outputs/`。
 
 ### Step 2: 运行填表脚本
 
 ```bash
 cd <skill_dir>/scripts
 python fill_table.py \
-  --config <config.json路径（系统临时目录）> \
+  --hf-model <HF model id> \          # 或 --config <path> / --config-dir <dir>
   --serve "<拉起命令字符串>" \
-  --model-name "<表格显示名>" \
-  --hbm <64|96> \
+  --model-name "<表格显示名，可选>" \
+  --hbm <64|80|96> \
   --B <平均请求长度> \
   --non-torch <3.2|3.5> \
   --graph <2.0|2.5> \
-  --warmup-log <日志路径，可选>
+  --warmup-log <日志路径，可选> \
+  [--dry-run]                          # 只算不写表，快速预览
 # 不传 --out 时，默认输出到 <skill_dir>/outputs/<model-name>-memory-table.xlsx
 ```
 
 脚本会：
-1. 解析拉起命令 → 部署参数
-2. 读 config.json → 架构参数
-3. 按 W8A8/BF16 估算单卡权重
-4. 按 `vllm_ascend_memory_formulas.py`（源码口径）算 available_kv / num_blocks / 并发
+1. 解析拉起命令 → 部署参数（TP/DP/EP/util/max-model-len/quant/...）
+2. 读 config.json → 架构参数（L/Hkv/D/hidden_size/experts/...）
+3. 按 W8A8/BF16 估算单卡权重（解析式分项）
+4. 按 `vllm_ascend_memory_formulas.py`（内置源码口径）算 available_kv / num_blocks / 并发
 5. 若有 warmup 日志 → 用实测值覆盖理论占位
 6. 基于预填模板 `template.xlsx` 填入 B 列数值，并在 C 列追加具体数字（保留模板里已固定的公式/源码说明）
 7. 输出到 `outputs/`（含「假设与说明」页）
+
+> `--dry-run` 只打印计算结果不写 xlsx，适合快速对比不同 TP/HBM 配置。
 
 ### Step 3: 汇报结果
 
@@ -78,7 +111,7 @@ python fill_table.py \
 
 ## 公式口径
 
-所有公式对齐本地 vllm / vllm-ascend 源码，详见 [references/formulas.md](references/formulas.md)。核心：
+所有公式对齐 vllm / vllm-ascend 源码（**公式已内置在 skill 中，无需本地源码**），详见 [references/formulas.md](references/formulas.md)。核心：
 
 - `requested = total_memory × gpu_memory_utilization`（`worker.py:460`）
 - `available_kv = requested − (weights + peak_act + non_torch)` **不含 graph**（`worker.py:581`）
@@ -109,9 +142,20 @@ python fill_table.py \
 
 ## 文件
 
+- `SKILL.md` — 本说明
+- `requirements.txt` — 依赖清单（仅 `openpyxl`）
 - `scripts/fill_table.py` — 主计算填表脚本（执行；只写 B 列值 + 向 C 列追加动态数字）
-- `scripts/vllm_ascend_memory_formulas.py` — 源码口径公式封装
+- `scripts/vllm_ascend_memory_formulas.py` — 源码口径公式封装（内置，无需 vllm/vllm-ascend）
 - `scripts/template.xlsx` — 预填模板（A 列标签 + C 列公式/源码说明已固定）
 - `scripts/build_template.py` — 模板生成脚本（公式口径变更时改它并重跑 `python build_template.py`）
 - `outputs/` — 所有生成的 xlsx 表格存放处（脚本默认输出目录）
 - `references/formulas.md` — 完整公式-源码对应表
+
+## 常见问题
+
+- **Q: 没有 vllm / vllm-ascend 源码能用吗？** A: 能。公式已内置在 `vllm_ascend_memory_formulas.py`，源码锚点只是溯源标注。
+- **Q: 没装 torch / NPU 驱动能用吗？** A: 能。脚本只用 `openpyxl` + 标准库，纯计算，不调用任何 NPU / torch API。
+- **Q: 不想下载几 GB 权重怎么办？** A: 用 `--hf-model`，脚本只下 `config.json`（几 KB）。
+- **Q: 国内访问 HF 慢？** A: `set HF_ENDPOINT=https://hf-mirror.com`（PowerShell）或 `export HF_ENDPOINT=https://hf-mirror.com`（bash）。
+- **Q: 私有 / gated 模型？** A: 设置环境变量 `HF_TOKEN=<your_token>`。
+- **Q: 拉起命令里没写 --max-model-len？** A: 脚本自动回退到 `config.max_position_embeddings` / `seq_length`。
