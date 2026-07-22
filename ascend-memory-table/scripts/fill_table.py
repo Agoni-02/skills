@@ -451,6 +451,163 @@ def sc(ws, r, c, v, fill=None):
     return cell
 
 
+def build_row_formulas(a: dict, deploy: dict, wbk: dict, layout: KVLayout,
+                       budget: MemoryBudget, hybrid: bool, num_blocks: int,
+                       max_conc: float, gpu_tokens: int, blocks_per_req: int,
+                       measured: dict, B: int, w_gib: float, act_gib: float,
+                       nt_gib: float, g_gib: float, cur_kv: float, fit_req: float,
+                       full_free: float, kv_mib: float, idx_mib: float,
+                       sum_mib: float, Hkv_local: int) -> dict:
+    """
+    Generate per-model C-column formula text (aligned to vllm / vllm-ascend source).
+    Returns {row: formula_text}. Formulas are NOT fixed — they adapt to the detected
+    architecture (GQA vs MLA, MoE vs dense, shared/index/draft presence, quant scheme).
+    """
+    TP, EP = deploy["TP"], deploy["EP"]
+    bpe = layout.bytes_per_elem
+    L = a["L"]
+    req_gib = round(budget.requested_bytes() / GiB, 3)
+    has_log = bool(measured)
+    draft_mib = round(layout.draft_bytes_per_token / MiB, 6)
+    f: dict[int, str] = {}
+
+    # Row 9 — Hkv
+    if a["is_mla"]:
+        f[9] = (f"MLA 不使用 Hkv（KV cache 由 kv_lora_rank 决定）；Hkv={a['Hkv']} 仅参考 "
+                f"[MLAAttentionSpec; vllm_ascend MLA]")
+    else:
+        f[9] = (f"全局 num_key_value_heads={a['Hkv']}；TP 后 Hkv_local=max(1,Hkv//TP)"
+                f"=max(1,{a['Hkv']}//{TP})={Hkv_local} [AttentionSpec TP 切分]")
+
+    # Row 16 — experts_per_device
+    if a["num_experts"]:
+        f[16] = (f"num_experts // EP = {a['num_experts']}//{EP}={a['num_experts']//EP} "
+                 f"[MoE EP 分片; vllm/distributed]")
+    else:
+        f[16] = "无 MoE → 0 [dense 模型]"
+
+    # Row 21 — EP
+    if deploy["enable_expert_parallel"]:
+        f[21] = f"EP = TP×DP = {TP}×{deploy['DP']}={EP}（开 --enable-expert-parallel）[vllm-Ascend MoE EP]"
+    else:
+        f[21] = f"EP = TP = {TP}（未开 --enable-expert-parallel，专家按 TP 切）[vllm/distributed]"
+
+    # Row 24 — 权重 (GiB)
+    if has_log:
+        f[24] = (f"实测 model_runner.model_memory_usage = {w_gib} GiB [worker.py::load_model; "
+                 f"日志 'Loading model weights took ...']")
+    else:
+        f[24] = (f"理论估算 = {w_gib} GiB（绿底，见行39 分项）；拉起后用 warmup 日志 'Loading model "
+                 f"weights took X GB' 覆盖 [worker.py::load_model]")
+
+    # Row 29 — Current KV
+    f[29] = (f"available_kv = requested − (W + peak_act + non_torch) = {req_gib} − "
+             f"({w_gib}+{act_gib}+{nt_gib}) = {cur_kv} GiB ※不含 graph [worker.py:581]")
+
+    # Row 30 — fit_requested
+    f[30] = (f"requested − (W+act+non_torch+graph) − 150MiB = {req_gib} − "
+             f"({w_gib}+{act_gib}+{nt_gib}+{g_gib}) − 150MiB = {fit_req} GiB [worker.py:728]")
+
+    # Row 31 — full_free
+    f[31] = (f"init_free − (W+act+non_torch+graph) − 150MiB = {budget.hbm_gib} − "
+             f"({w_gib}+{act_gib}+{nt_gib}+{g_gib}) − 150MiB = {full_free} GiB [worker.py:729]")
+
+    # Row 32 — num_blocks
+    eff = layout.effective_main_layers
+    if hybrid:
+        gs = max(eff, a["L_sparse"] if a["L_sparse"] else eff)
+        if a["is_mla"]:
+            f[32] = (f"hybrid: page=block·(kv_lora+qk_rope)·dtype (MLA); "
+                     f"group_size=max(L+draft,L_sparse)=max({eff},{a['L_sparse']})={gs}; "
+                     f"num_blocks=avail//page//gs={num_blocks} [kv_cache_utils.py:1380]")
+        else:
+            f[32] = (f"hybrid: page=2·block·Hkv_local·D·dtype; "
+                     f"group_size=max(L+draft,L_sparse)=max({eff},{a['L_sparse']})={gs}; "
+                     f"num_blocks=avail//page//gs={num_blocks} [kv_cache_utils.py:1380]")
+    else:
+        if a["is_mla"]:
+            f[32] = (f"uniform: page=block·(kv_lora+qk_rope)·dtype (MLA, no ×2); "
+                     f"num_blocks=avail//page//(L+draft)={num_blocks} "
+                     f"[kv_cache_utils.py:1009 get_num_blocks]")
+        else:
+            f[32] = (f"uniform: page=2·block·Hkv_local·D·dtype; "
+                     f"num_blocks=avail//page//(L+draft)={num_blocks} "
+                     f"[kv_cache_utils.py:1009 get_num_blocks]")
+
+    # Row 35 — max_concurrency
+    f[35] = (f"max_concurrency = num_blocks / blocks_per_req = {num_blocks}/{blocks_per_req}"
+             f"={round(max_conc,4)} [kv_cache_utils.py:958]")
+
+    # Row 39 — 权重 breakdown (per-model)
+    terms = []
+    if a["is_mla"]:
+        attn_desc = (f"Q_attn/TP (MLA: H·q_lora + q_lora·n_h·(qk_nope+qk_rope) + "
+                     f"H·(kv_lora+qk_rope) + kv_lora·n_h·v_head + n_h·v_head·H)")
+    else:
+        attn_desc = f"Q_attn/TP (GQA: H·n_h·D + 2·H·n_kv·D + n_h·D·H)"
+    if wbk.get("K_emb_lm_tp"):
+        terms.append(f"K_emb_lm/TP·2={wbk['K_emb_lm_tp']}")
+    if wbk.get("K_norms"):
+        terms.append(f"K_norms·2={wbk['K_norms']}")
+    if wbk.get("K_gate_fp32"):
+        terms.append(f"K_gate·4(fp32)={wbk['K_gate_fp32']}")
+    if wbk.get("Q_attn_tp"):
+        terms.append(f"{attn_desc}={wbk['Q_attn_tp']}")
+    if wbk.get("Q_dense_tp"):
+        terms.append(f"Q_dense/TP={wbk['Q_dense_tp']}")
+    if wbk.get("Q_shared_tp"):
+        terms.append(f"Q_shared/TP={wbk['Q_shared_tp']}")
+    if wbk.get("Q_indexer_tp"):
+        terms.append(f"Q_indexer/TP={wbk['Q_indexer_tp']}")
+    if wbk.get("Q_experts_ep"):
+        terms.append(f"Q_experts/EP={wbk['Q_experts_ep']}")
+    f[39] = " + ".join(terms) + f" = {wbk['weight']} GiB [worker.py + 推导; 行24 同值]"
+
+    # Row 41 — 可用KV
+    f[41] = f"= 行29 = {cur_kv} GiB [worker.py:581]"
+
+    # Row 42 — 单token kv
+    if a["is_mla"]:
+        f[42] = (f"L×(kv_lora_rank+qk_rope_head_dim)×dtype = {L}×({a['kv_lora_rank']}+"
+                 f"{a['qk_rope_head_dim']})×{bpe} = {kv_mib} MiB (MLA, 无 ×2) "
+                 f"[MLAAttentionSpec.real_page_size_bytes/block_size]")
+    else:
+        f[42] = (f"L×2×Hkv_local×D×dtype = {L}×2×{Hkv_local}×{a['D']}×{bpe} = {kv_mib} MiB "
+                 f"[AttentionSpec.real_page_size_bytes/block_size]")
+
+    # Row 43 — 单token index
+    if a["IdxD"]:
+        f[43] = (f"L_sparse×1×IdxD×dtype = {a['L_sparse']}×1×{a['IdxD']}×{bpe} = {idx_mib} MiB "
+                 f"(key-only, 无 ×2) [MLAAttentionSpec; indexer.py:161]")
+    else:
+        f[43] = "无 sparse indexer → 0 [config 无 sparse_attention_config 或 sparse_index_dim=0]"
+
+    # Row 44 — draft
+    if a["draft_layers"]:
+        per = round(layout.per_layer_main_bytes / MiB, 6)
+        f[44] = (f"draft_layers×per_layer_main_kv = {a['draft_layers']}×{per} = {draft_mib} MiB "
+                 f"(MTP/NextN draft 复用主层 KV) [vllm/v1/spec_decode]")
+    else:
+        f[44] = "无 MTP/NextN draft 层 → 0 [config 无 num_mtp_modules/num_nextn_predict_layers]"
+
+    # Row 45 — 合计
+    f[45] = (f"main + index + draft = {kv_mib}+{idx_mib}+{draft_mib} = {sum_mib} MiB "
+             f"(每卡口径，含 TP 分片) [推导]")
+
+    # Row 46 — 可容纳tokens
+    f[46] = (f"max_concurrency × max_model_len = {round(max_conc,4)}×{deploy['max_model_len']} "
+             f"= {gpu_tokens} [kv_cache_utils.py:1833 get_kv_cache_capacity]")
+
+    # Row 47 — 最大并发
+    if sum_mib:
+        f[47] = (f"(available_kv / sum_bytes_per_token) / B = ({cur_kv} GiB / {sum_mib} MiB) / "
+                 f"{B} = {round(cur_kv * GiB / (layout.sum_bytes_per_token * B), 3)} "
+                 f"[kv_cache_utils.py:958]")
+    else:
+        f[47] = "sum_bytes_per_token=0 → 0"
+    return f
+
+
 def fill_xlsx(template_path: Path, out_path: Path, model_name: str, a: dict,
               deploy: dict, wbk: dict, budget: MemoryBudget, layout: KVLayout,
               hybrid: bool, num_blocks: int, max_conc: float, gpu_tokens: int,
@@ -476,8 +633,8 @@ def fill_xlsx(template_path: Path, out_path: Path, model_name: str, a: dict,
     has_log = bool(measured)
     wfill = MEAS if has_log else EST
 
-    # 模板已预填 A 列标签 + C 列公式/源码说明；本函数只写 B 列值，
-    # 并在含动态数值的行向 C 列「追加」具体数字（保留模板里的固定公式文本）。
+    # 模板 A 列标签固定；B 列写数值；C 列公式由 build_row_formulas 按本模型架构动态生成
+    # （覆盖模板里的通用占位），不再使用固定公式文本。
     def put(r, v, fill=None):
         cell = ws.cell(r, 2, v)
         cell.alignment = Alignment(wrap_text=True, vertical="center")
@@ -485,10 +642,10 @@ def fill_xlsx(template_path: Path, out_path: Path, model_name: str, a: dict,
             cell.fill = fill
         return cell
 
-    def app_c(r, text):
-        cur = ws.cell(r, 3).value or ""
-        ws.cell(r, 3, (cur + text) if cur else text)
-        ws.cell(r, 3).alignment = Alignment(wrap_text=True, vertical="center")
+    def set_c(r, text):
+        cell = ws.cell(r, 3, text)
+        cell.alignment = Alignment(wrap_text=True, vertical="center")
+        return cell
 
     put(2, B, YELLOW)
     put(3, deploy["max_model_len"], YELLOW)
@@ -507,24 +664,13 @@ def fill_xlsx(template_path: Path, out_path: Path, model_name: str, a: dict,
     put(43, idx_mib); put(44, round(layout.draft_bytes_per_token / MiB, 6)); put(45, sum_mib); put(46, gpu_tokens)
     put(47, round(cur_kv * GiB / (layout.sum_bytes_per_token * B), 3) if layout.sum_bytes_per_token else 0)
 
-    # 仅向含动态数值的行追加具体数字到 C 列
-    app_c(9, f" → Hkv_local={Hkv_local}=max(1,{a['Hkv']}//{deploy['TP']})" + (" [MLA: Hkv unused]" if a["is_mla"] else ""))
-    app_c(16, f"={a['num_experts']}/{deploy['EP']}")
-    app_c(21, f"={deploy['TP']}×{deploy['DP']}")
-    app_c(24, f" → 理论W8A8={wbk['weight']}")
-    app_c(32, f" → 本例{'hybrid' if hybrid else 'uniform'}" + (f" +{a['draft_layers']} draft" if a["draft_layers"] else ""))
-    app_c(35, f"={num_blocks}/{blocks_per_req}")
-    app_c(39, " → " + "+".join(f"{k}={v}" for k, v in wbk.items() if k != "weight") + f"={wbk['weight']}")
-    app_c(41, f"={round(budget.requested_bytes()/GiB,3)}−W−act−non_torch={cur_kv}")
-    if a["is_mla"]:
-        app_c(42, f"=L×(kv_lora_rank+qk_rope_head_dim)×dtype = {a['L']}×({a['kv_lora_rank']}+{a['qk_rope_head_dim']})×{layout.bytes_per_elem}  [MLA, no ×2]")
-    else:
-        app_c(42, f"={a['L']}×2×{Hkv_local}×{a['D']}×{layout.bytes_per_elem}")
-    app_c(43, f"={a['L_sparse']}×1×{a['IdxD']}×{layout.bytes_per_elem}" if a["IdxD"] else " → 无indexer→0")
-    if a["draft_layers"]:
-        app_c(44, f"={a['draft_layers']}×per_layer_main_kv (MTP/NextN draft)")
-    app_c(46, f"={round(max_conc,4)}×{deploy['max_model_len']}")
-    app_c(47, f"={cur_kv}/{sum_mib}/{B}")
+    # C 列：按本模型架构动态生成公式（覆盖模板通用占位）
+    formulas = build_row_formulas(a, deploy, wbk, layout, budget, hybrid, num_blocks,
+                                  max_conc, gpu_tokens, blocks_per_req, measured, B,
+                                  w_gib, act_gib, nt_gib, g_gib, cur_kv, fit_req, full_free,
+                                  kv_mib, idx_mib, sum_mib, Hkv_local)
+    for r, text in formulas.items():
+        set_c(r, text)
 
     asum = wb.create_sheet("假设与说明")
     rows = [("项目", "说明"), ("HBM", f"{budget.hbm_gib} GiB"), ("量化", deploy.get("quantization") or "BF16"),

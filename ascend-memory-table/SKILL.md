@@ -133,7 +133,7 @@ python fill_table.py \
 3. 按 W8A8/BF16 估算单卡权重（解析式分项）
 4. 按 `vllm_ascend_memory_formulas.py`（内置源码口径）算 available_kv / num_blocks / 并发
 5. 若有 warmup 日志 → 用实测值覆盖理论占位
-6. 基于预填模板 `template.xlsx` 填入 B 列数值，并在 C 列追加具体数字（保留模板里已固定的公式/源码说明）
+6. 基于模板 `template.xlsx` 填入 B 列数值，并**按本模型架构动态生成 C 列公式**（覆盖模板占位，对齐 vllm/vllm-ascend 源码）
 7. 输出到 `outputs/`（含「假设与说明」页）
 
 > `--dry-run` 只打印计算结果不写 xlsx，适合快速对比不同 TP/HBM 配置。
@@ -162,14 +162,21 @@ python fill_table.py \
 
 ## 表格字段说明
 
-模板 47 行，分三段（A 列标签 + C 列公式/源码说明已预填固定，B 列由脚本按模型/部署参数填入）：
+模板 47 行，分三段（A 列标签固定；B 列由脚本按模型/部署参数填值；**C 列公式按本模型架构动态生成**，不再固定）：
 - **自定义配置项**（行1–16）：B、max-model-len、util、模型结构参数
 - **实测显存**（行23–35）：权重/激活/non_torch/graph/Current KV/fit_requested/full_free/num_blocks/block_size/GPU_KV_tokens/满长并发
 - **显存占用与并发**（行37–47）：权重/激活/可用KV/单token kv/index/draft/合计/可容纳tokens/最大并发
 
-> 模板中 C 列的「计算公式 + 源码锚点」已逐行核对 `references/formulas.md` 并固定写入 `template.xlsx`，
-> 脚本运行时只在含动态数值的行（如行9/16/21/24/32/35/39/41/42/43/46/47）向 C 列追加具体数字，
-> 不再每次重新生成公式文本。若公式口径需更新，先改 `build_template.py` 并重新生成模板（见下）。
+> **公式不固定，按模型动态生成**：模板 `template.xlsx` 的 C 列只放通用占位（标注「运行时按模型生成」+ 源码锚点）；
+> 真正的公式由 `fill_table.py::build_row_formulas` 在运行时根据解析到的架构（GQA/MLA、MoE/dense、shared/index/draft、量化方案）逐行生成，
+> 对齐 `references/formulas.md` 与 vllm / vllm-ascend 源码。每个模型拿到的 C 列公式都不同：
+> - **Qwen3-MoE**：权重 = emb/TP + norms + gate + attn/TP + experts/EP（无 shared/indexer）；单 token KV = L×2×Hkv_local×D×dtype
+> - **DeepSeek-V3 (MLA)**：单 token KV = L×(kv_lora_rank+qk_rope_head_dim)×dtype（无 ×2）；含 shared/draft 分项
+> - **MiniMax-M3**：含 indexer 分项 + 7 层 MTP draft；hybrid num_blocks 用 max(L+draft, L_sparse)
+> - **Dense (Llama 等)**：权重 = emb/TP + norms + attn/TP + dense_mlp/TP；无 MoE 分项
+>
+> 若遇到新架构（公式未覆盖），agent 应到模型 config.json + vllm/vllm-ascend 源码核对后扩展 `build_row_formulas`，
+> 而不是套用固定公式。模板结构（行号/A 列标签）变更才需改 `build_template.py` 并重跑 `python build_template.py`。
 
 ## 增强信息（可选附加）
 
@@ -184,8 +191,8 @@ python fill_table.py \
 - `requirements.txt` — 依赖清单（仅 `openpyxl`）
 - `scripts/fill_table.py` — 主计算填表脚本（执行；只写 B 列值 + 向 C 列追加动态数字）
 - `scripts/vllm_ascend_memory_formulas.py` — 源码口径公式封装（内置，无需 vllm/vllm-ascend）
-- `scripts/template.xlsx` — 预填模板（A 列标签 + C 列公式/源码说明已固定）
-- `scripts/build_template.py` — 模板生成脚本（公式口径变更时改它并重跑 `python build_template.py`）
+- `scripts/template.xlsx` — 模板骨架（A 列标签固定；C 列公式为通用占位，运行时按模型覆盖）
+- `scripts/build_template.py` — 模板骨架生成脚本（仅当行号/A 列标签结构变更时改它并重跑 `python build_template.py`）
 - `outputs/` — 所有生成的 xlsx 表格存放处（脚本默认输出目录）
 - `references/formulas.md` — 完整公式-源码对应表
 
