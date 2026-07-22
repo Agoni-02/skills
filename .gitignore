@@ -6,3 +6,6 @@ __pycache__/
 # 临时 / 系统
 .DS_Store
 Thumbs.db
+
+# Excel 打开时的锁文件（绝不入库）
+~$*
