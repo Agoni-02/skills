@@ -40,16 +40,17 @@ WARN = PatternFill("solid", fgColor="FCE8E6")
 MEAS = PatternFill("solid", fgColor="D6EAF8")  # measured (from log)
 
 
-# ---------- HuggingFace / ModelScope config.json auto-download ----------
-# Resolves a model id (e.g. "MiniMaxAI/MiniMax-M3") or URL to a local config.json.
-# Downloads ONLY config.json (a few KB), never weights.
+# ---------- HuggingFace / ModelScope auto-download ----------
+# Resolves a model id (e.g. "MiniMaxAI/MiniMax-M3") or URL to a local file.
+# Downloads ONLY small metadata files (config.json, quant_model_description.json), never weights.
 # Sources (auto-fallback HF → ModelScope when HF unreachable):
-#   - HuggingFace:  https://huggingface.co/<id>/resolve/<rev>/config.json
-#   - ModelScope:   https://modelscope.cn/api/v1/models/<id>/repo?Revision=<rev>&FilePath=config.json
+#   - HuggingFace:  https://huggingface.co/<id>/resolve/<rev>/<file>
+#   - ModelScope:   https://modelscope.cn/api/v1/models/<id>/repo?Revision=<rev>&FilePath=<file>
 # Uses plain urllib (no huggingface_hub / modelscope SDK) so the skill stays self-contained.
 HF_ENDPOINT = os.environ.get("HF_ENDPOINT", "https://huggingface.co")
 HF_TOKEN = os.environ.get("HF_TOKEN") or os.environ.get("HUGGING_FACE_HUB_TOKEN")
 MS_ENDPOINT = os.environ.get("MODELSCOPE_ENDPOINT", "https://modelscope.cn")
+MS_TOKEN = os.environ.get("MODELSCOPE_API_TOKEN")
 
 
 def _hf_resolve_id(s: str) -> str:
@@ -68,74 +69,151 @@ def _http_get(url: str, headers: dict, timeout: int = 30) -> bytes:
         return r.read()
 
 
-def _save_config(data: bytes, out: Path) -> None:
+def _save_json(data: bytes, out: Path) -> None:
     try:
         json.loads(data)  # validate
     except json.JSONDecodeError:
-        raise ValueError(f"downloaded content is not valid JSON")
+        raise ValueError("downloaded content is not valid JSON")
     out.write_bytes(data)
 
 
-def _hf_download_config(model_id: str, dest_dir: Path) -> Path:
-    """Download config.json from HuggingFace into dest_dir; return local path. Raises on failure."""
+def _hf_fetch(model_id: str, filename: str, dest_dir: Path) -> Path:
+    """Download a file from HuggingFace into dest_dir; return local path. Raises on failure."""
     dest_dir.mkdir(parents=True, exist_ok=True)
     safe = model_id.replace("/", "_").replace("@", "_rev_")
-    out = dest_dir / f"{safe}__hf__config.json"
+    out = dest_dir / f"{safe}__hf__{filename.replace('/', '_')}"
     if out.exists() and out.stat().st_size > 0:
         return out
     mid, _, rev = model_id.partition("@")
     rev = rev or "main"
-    url = f"{HF_ENDPOINT}/{mid}/resolve/{rev}/config.json"
+    url = f"{HF_ENDPOINT}/{mid}/resolve/{rev}/{filename}"
     headers = {"User-Agent": "ascend-memory-table/1.0"}
     if HF_TOKEN:
         headers["Authorization"] = f"Bearer {HF_TOKEN}"
     data = _http_get(url, headers)
-    _save_config(data, out)
+    _save_json(data, out)
     return out
 
 
-def _ms_download_config(model_id: str, dest_dir: Path) -> Path:
-    """Download config.json from ModelScope into dest_dir; return local path. Raises on failure."""
+def _ms_fetch(model_id: str, filename: str, dest_dir: Path) -> Path:
+    """Download a file from ModelScope into dest_dir; return local path. Raises on failure."""
     dest_dir.mkdir(parents=True, exist_ok=True)
     safe = model_id.replace("/", "_").replace("@", "_rev_")
-    out = dest_dir / f"{safe}__ms__config.json"
+    out = dest_dir / f"{safe}__ms__{filename.replace('/', '_')}"
     if out.exists() and out.stat().st_size > 0:
         return out
     mid, _, rev = model_id.partition("@")
     rev = rev or "master"
-    url = f"{MS_ENDPOINT}/api/v1/models/{mid}/repo?Revision={rev}&FilePath=config.json"
+    url = f"{MS_ENDPOINT}/api/v1/models/{mid}/repo?Revision={rev}&FilePath={filename}"
     headers = {"User-Agent": "ascend-memory-table/1.0"}
+    if MS_TOKEN:
+        headers["Authorization"] = f"Bearer {MS_TOKEN}"
     data = _http_get(url, headers)
-    _save_config(data, out)
+    _save_json(data, out)
     return out
 
 
-def download_config(model_id: str, dest_dir: Path, source: str = "auto") -> tuple[Path, str]:
+def download_file(model_id: str, filename: str, dest_dir: Path, source: str = "auto",
+                  prefer: str | None = None) -> tuple[Path | None, str | None]:
     """
-    Download config.json for a model id. Returns (local_path, source_used).
-    source: 'hf' | 'ms' | 'auto' (auto tries HF first, falls back to ModelScope).
+    Download a metadata file for a model id. Returns (local_path_or_None, source_used_or_None).
+    source: 'hf' | 'ms' | 'auto'. A 404/missing file is not fatal → returns (None, None).
+    `prefer` pins a source (used to reuse the source that worked for config.json).
     """
     mid = _hf_resolve_id(model_id)
-    errors = []
     order = []
-    if source in ("auto", "hf"):
+    if prefer:
+        order.append(prefer)
+    if source in ("auto", "hf") and "hf" not in order:
         order.append("hf")
-    if source in ("auto", "ms"):
+    if source in ("auto", "ms") and "ms" not in order:
         order.append("ms")
+    last_err = None
     for src in order:
         try:
             if src == "hf":
-                return _hf_download_config(mid, dest_dir), "hf"
+                return _hf_fetch(mid, filename, dest_dir), "hf"
             else:
-                return _ms_download_config(mid, dest_dir), "ms"
+                return _ms_fetch(mid, filename, dest_dir), "ms"
         except Exception as e:
-            errors.append(f"{src}: {e}")
-    sys.exit(
-        f"[fill_table] 下载 config.json 失败（已尝试 {', '.join(order)}）: model_id={mid}\n"
-        f"  错误: {'; '.join(errors)}\n"
-        f"  排查: 1) 模型 id 是否正确 2) 私有/gated 仓库需设 HF_TOKEN / MODELSCOPE_API_TOKEN "
-        f"3) 国内可设 HF_ENDPOINT=https://hf-mirror.com 或用 --source ms 4) 网络代理"
-    )
+            last_err = e
+            # 404 / missing file → try next source; other errors also non-fatal for optional files
+            continue
+    return None, None
+
+
+def download_config(model_id: str, dest_dir: Path, source: str = "auto") -> tuple[Path, str]:
+    """Download config.json (required). Exits with helpful error if all sources fail."""
+    path, used = download_file(model_id, "config.json", dest_dir, source=source)
+    if path is None:
+        sys.exit(
+            f"[fill_table] 下载 config.json 失败（已尝试 {source}）: model_id={_hf_resolve_id(model_id)}\n"
+            f"  排查: 1) 模型 id 是否正确 2) 私有/gated 仓库需设 HF_TOKEN / MODELSCOPE_API_TOKEN "
+            f"3) 国内可设 HF_ENDPOINT=https://hf-mirror.com 或用 --source ms 4) 网络代理"
+        )
+    return path, used
+
+
+# ---------- KV cache dtype (bytes_per_elem) auto-detection ----------
+# Official rules (verified against upstream source):
+#   1. vLLM default cache_dtype = "auto" → uses model dtype (BF16 → 2 bytes)
+#      [vllm/config/cache.py: CacheConfig.cache_dtype = "auto"]
+#   2. --kv-cache-dtype CLI flag overrides: fp8/fp8_e4m3/fp8_e5m2/int8 → 1 byte; else 2
+#   3. vLLM-Ascend C8 (INT8 KV cache): driven by the checkpoint's quant_model_description.json
+#      with "kv_cache_type": "C8" → overrides kv_cache_torch_dtype = torch.int8 (1 byte).
+#      NOT enabled by --quantization ascend alone: W8A8 (weight only) keeps KV BF16;
+#      W8A8C8 (weight + KV) sets kv_cache_type=C8. Activates automatically, no CLI flag needed.
+#      [vllm_ascend/quantization/modelslim_config.py: kv_cache_type == "C8"]
+def detect_bpe(deploy: dict, model_id: str | None, dest_dir: Path, source: str,
+              prefer_source: str | None, local_config_dir: Path | None) -> tuple[int, str]:
+    """
+    Determine KV cache bytes-per-element. Returns (bpe, explanation).
+    Priority: explicit --kv-cache-dtype > quant_model_description.json (C8) > vLLM default (BF16).
+    """
+    # 1) explicit --kv-cache-dtype in serve command
+    kcd = deploy.get("kv_cache_dtype")
+    if kcd:
+        low = str(kcd).lower()
+        if "8" in low:  # fp8, fp8_e4m3, fp8_e5m2, int8
+            return 1, f"--kv-cache-dtype={kcd} → 1 byte/elem [vllm CacheConfig.cache_dtype]"
+        return 2, f"--kv-cache-dtype={kcd} → 2 bytes/elem (BF16)"
+
+    # 2) quant_model_description.json (Ascend C8 / INT8 KV cache)
+    qd = _load_quant_desc(model_id, dest_dir, source, prefer_source, local_config_dir)
+    if qd:
+        kt = (qd.get("kv_cache_type") or qd.get("kv_quant_type") or "")
+        kt_u = str(kt).upper()
+        if "C8" in kt_u or "INT8" in kt_u:
+            return 1, (f"quant_model_description.json: kv_cache_type={kt!r} → INT8 KV cache, "
+                      f"1 byte/elem [vllm_ascend/quantization/modelslim_config.py]")
+        return 2, (f"quant_model_description.json: kv_cache_type={kt!r} → BF16 KV cache, "
+                  f"2 bytes/elem (W8A8 weight-only, no C8)")
+
+    # 3) vLLM default
+    return 2, "vLLM default cache_dtype='auto' → model dtype (BF16, 2 bytes/elem) [vllm/config/cache.py]"
+
+
+def _load_quant_desc(model_id: str | None, dest_dir: Path, source: str,
+                     prefer_source: str | None, local_config_dir: Path | None) -> dict | None:
+    """Load quant_model_description.json (Ascend ModelSlim quant config) if present."""
+    # local: sit next to config.json
+    if local_config_dir is not None:
+        local = local_config_dir / "quant_model_description.json"
+        if local.exists():
+            try:
+                return json.loads(local.read_text(encoding="utf-8"))
+            except Exception:
+                return None
+    # remote: download from the same source as config.json
+    if model_id:
+        path, _ = download_file(model_id, "quant_model_description.json", dest_dir,
+                                source=source, prefer=prefer_source)
+        if path is not None:
+            try:
+                return json.loads(path.read_text(encoding="utf-8"))
+            except Exception:
+                return None
+    return None
 
 
 # ---------- serve command parsing ----------
@@ -510,6 +588,8 @@ def main():
     if not args.hf_model and not args.ms_model and not args.config and not args.config_dir:
         sys.exit("[fill_table] 必须提供模型来源之一：--hf-model / --ms-model / --config / --config-dir")
 
+    tmp_dir = Path(tempfile.gettempdir()) / "ascend-mem-table"
+
     if args.hf_model or args.ms_model:
         raw_id = args.hf_model or args.ms_model
         model_id = _hf_resolve_id(raw_id)
@@ -523,16 +603,22 @@ def main():
         # for --hf-model with --source auto, allow fallback to ms
         if args.hf_model and args.source == "auto":
             source = "auto"
-        tmp_dir = Path(tempfile.gettempdir()) / "ascend-mem-table"
-        cfg_path, used = download_config(model_id, tmp_dir, source=source)
+        tmp_dir_inner = Path(tempfile.gettempdir()) / "ascend-mem-table"
+        cfg_path, used = download_config(model_id, tmp_dir_inner, source=source)
         if used == "ms":
             print(f"[fill_table] config.json 来自 ModelScope（HF 不可达或 --source ms）")
         default_name = model_id.split("@", 1)[0].split("/", 1)[-1]
+        prefer_source = used
+        local_config_dir = None
     else:
         cfg_path = Path(args.config) if args.config else Path(args.config_dir) / "config.json"
         if not cfg_path.exists():
             sys.exit(f"[fill_table] config.json 不存在: {cfg_path}")
         default_name = cfg_path.parent.name
+        model_id = None
+        prefer_source = None
+        local_config_dir = cfg_path.parent
+        source = args.source
 
     cfg = load_config(cfg_path)
     a = arch_from_config(cfg)
@@ -553,7 +639,9 @@ def main():
     n_h_local = max(1, a["n_heads"] // deploy["TP"])
     T = deploy["max_num_batched_tokens"]
     act_b = estimate_peak_activation_bytes(T, a["hidden_size"], n_h_local, a["D"], a["num_experts_per_tok"], deploy["EP"])
-    bpe = 1 if (deploy.get("kv_cache_dtype") and "8" in str(deploy["kv_cache_dtype"]).lower()) else 2
+    # KV cache dtype auto-detection: --kv-cache-dtype > quant_model_description.json (C8) > vLLM default (BF16)
+    bpe, bpe_reason = detect_bpe(deploy, model_id, tmp_dir, source, prefer_source, local_config_dir)
+    print(f"[fill_table] KV cache dtype → bytes_per_elem={bpe}  ({bpe_reason})")
     budget = MemoryBudget(args.hbm, deploy["util"], wbk["weight"], act_b / GiB, args.non_torch, args.graph, args.hbm)
     layout = KVLayout(
         a["L"], a["L_sparse"], a["Hkv"], Hkv_local, a["D"], a["IdxD"], bpe,

@@ -74,10 +74,27 @@ python fill_table.py \
 | **单卡 HBM 容量**（64 / 96 / 80 GiB？） | 决定 requested_memory 与可用 KV 上限 | 64 GiB |
 | **warmup 日志文件路径**（可选） | 有日志→权重/激活/non_torch/graph/可用KV 全部用实测值（蓝底）；无→理论占位（绿底） | 无 |
 | **平均请求长度 B**（输入+输出 tokens） | 决定「最大并发（KV容量理论）」行 | 8192 |
-| **KV cache dtype**（BF16 还是 C8/INT8？） | 决定 bytes_per_elem=2 还是 1，影响单 token cache 与 num_blocks | BF16（2） |
 | **non-torch / NPU graph 经验值** | TP/DP 越大通信缓冲越大 | non_torch=3.2, graph=2.0 GiB |
 
-> 提示话术示例：「为了让表格数据更准，建议补充：① 单卡 HBM 是 64 还是 96 GiB？② 有没有 vllm-ascend 的 warmup 日志（有日志就能用实测权重/激活/KV，否则只能理论估算）？③ KV cache 是 BF16 还是 C8？④ 平均请求长度大概多少？」
+> **KV cache dtype 不需要问用户**——脚本自动判定（见下「KV cache dtype 自动判定」）。`--kv-cache-dtype` 显式指定时以用户为准。
+
+> 提示话术示例：「为了让表格数据更准，建议补充：① 单卡 HBM 是 64 还是 96 GiB？② 有没有 vllm-ascend 的 warmup 日志（有日志就能用实测权重/激活/KV，否则只能理论估算）？③ 平均请求长度大概多少？」
+
+## KV cache dtype 自动判定（bytes_per_elem）
+
+脚本按优先级自动决定 KV cache 每元素字节数，**无需问用户**（口径对齐 vLLM / vLLM-Ascend 源码）：
+
+1. **拉起命令显式 `--kv-cache-dtype`**：`fp8`/`fp8_e4m3`/`fp8_e5m2`/`int8` → 1 字节；`auto`/`bfloat16`/`float16` → 2 字节
+   - 源码：`vllm/config/cache.py: CacheConfig.cache_dtype = "auto"`
+2. **否则查 checkpoint 的 `quant_model_description.json`**（自动从 HF/ModelScope 下载，仅几 KB）：`kv_cache_type == "C8"` → INT8 KV cache = 1 字节；否则 BF16 = 2 字节
+   - 源码：`vllm_ascend/quantization/modelslim_config.py`（`kv_cache_type == "C8"` 时覆盖 `kv_cache_torch_dtype = torch.int8`）
+   - ⚠️ **W8A8 ≠ C8**：`--quantization ascend` 只量化权重，KV cache 仍为 BF16；只有 W8A8**C8** 模型（checkpoint 含 `kv_cache_type=C8`）才是 INT8 KV
+3. **都没有**：vLLM 默认 `cache_dtype="auto"` → 跟随模型 dtype（BF16 = 2 字节）
+
+脚本启动时会打印判定结果与依据，例如：
+- `KV cache dtype → bytes_per_elem=2 (vLLM default cache_dtype='auto' → model dtype (BF16))`
+- `KV cache dtype → bytes_per_elem=1 (quant_model_description.json: kv_cache_type='C8' → INT8 KV cache)`
+- `KV cache dtype → bytes_per_elem=1 (--kv-cache-dtype=fp8 → 1 byte/elem)`
 
 ## 工作流程
 
