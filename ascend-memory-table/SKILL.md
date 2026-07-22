@@ -37,14 +37,33 @@ python fill_table.py \
 
 用户需提供（缺一不可）：
 
-1. **模型** — 三选一：
-   - `--hf-model <HF id 或 URL>`（**推荐，最省事**）：如 `MiniMaxAI/MiniMax-M3`、`Qwen/Qwen3-235B-A22B`，脚本自动从 HF 下载 `config.json`（仅几 KB，不下载权重），缓存到系统临时目录
+1. **模型** — 四选一：
+   - `--hf-model <HF id 或 URL>`：如 `MiniMaxAI/MiniMax-M3`、`Qwen/Qwen3-235B-A22B`、`deepseek-ai/DeepSeek-V3`，脚本自动从 HuggingFace 下载 `config.json`（仅几 KB，不下载权重），缓存到系统临时目录
+   - `--ms-model <ModelScope id 或 URL>`：国内推荐，从 ModelScope 下载 `config.json`（如 `Qwen/Qwen3-235B-A22B`）
    - `--config <本地 config.json 路径>`（或含它的模型目录用 `--config-dir`）
    - 已下载到本地的模型目录（`--config-dir`）
 2. **拉起命令** — `vllm serve ...` 或 `python -m vllm.entrypoints.openai.api_server ...` 的完整命令字符串（含 `--tensor-parallel-size`、`--gpu-memory-utilization`、`--max-model-len`、`--quantization` 等参数）
 
-> 国内访问 HF 慢？设环境变量 `HF_ENDPOINT=https://hf-mirror.com` 即可走镜像。
-> 私有 / gated 模型？设 `HF_TOKEN=<your_token>`。
+> **数据源**：`--source auto`（默认，先 HF 后 ModelScope 自动回退）| `hf`（仅 HF）| `ms`（仅 ModelScope）。
+> 国内访问 HF 慢？`--ms-model` 直接走 ModelScope，或设 `$env:HF_ENDPOINT="https://hf-mirror.com"`。
+> 私有 / gated 模型？设 `HF_TOKEN` 或 `MODELSCOPE_API_TOKEN`。
+
+## 支持的模型系列（config.json 字段自动适配）
+
+脚本会自动识别 `config.json` 的字段差异，无需用户指定模型类型。已核对 HuggingFace / ModelScope 上游真实 config：
+
+| 模型系列 | model_type | MoE 字段 | 注意点 |
+|---------|-----------|---------|--------|
+| MiniMax-M3 / M2.7 | `minimax_m3_vl` | `num_local_experts` + `dense_intermediate_size` + `shared_intermediate_size` + `moe_layer_freq[list]` | 稀疏 index 注意（`sparse_attention_config`），MTP draft 层（`num_mtp_modules`） |
+| Qwen3-MoE | `qwen3_moe` | `num_experts` + `moe_intermediate_size` + `decoder_sparse_step` / `mlp_only_layers` | 无 shared expert、无 sparse index |
+| DeepSeek-V2 / V3 | `deepseek_v2` / `deepseek_v3` | `n_routed_experts` + `n_shared_experts` + `moe_intermediate_size` + `first_k_dense_replace` | **MLA 注意**：KV cache 用 `kv_lora_rank + qk_rope_head_dim`（无 ×2），NextN draft（`num_nextn_predict_layers`） |
+| Dense（Llama / Qwen2 / GLM / 等） | `llama` / `qwen2` / `chatglm` ... | 无 MoE | 标准 GQA |
+
+字段归一化规则：
+- 专家数：`num_experts` / `num_local_experts` / `n_routed_experts` → 统一为 `num_experts`
+- 专家 intermediate：`moe_intermediate_size` / `intermediate_size` → `routed_intermediate`
+- 稠密层数：`first_k_dense_replace` / `moe_layer_freq[list]` / `mlp_only_layers` / `decoder_sparse_step` → `n_dense`
+- head_dim：缺失时（DeepSeek MLA）由 `qk_nope_head_dim + qk_rope_head_dim` 推导
 
 ## 输出前先问用户要这些信息（提高准确率）
 
@@ -116,10 +135,12 @@ python fill_table.py \
 - `requested = total_memory × gpu_memory_utilization`（`worker.py:460`）
 - `available_kv = requested − (weights + peak_act + non_torch)` **不含 graph**（`worker.py:581`）
 - `fit_requested = requested − (W+act+non_torch+graph) − 150MiB`（`worker.py:728`）
-- 单 token KV = `L × 2 × Hkv_local × D × dtype`，**Hkv_local = max(1, Hkv//TP)**（`AttentionSpec`）
+- **GQA 单 token KV** = `L × 2 × Hkv_local × D × dtype`，`Hkv_local = max(1, Hkv//TP)`（`AttentionSpec`）
+- **MLA 单 token KV**（DeepSeek-V2/V3）= `L × (kv_lora_rank + qk_rope_head_dim) × dtype`，**无 ×2**（压缩 latent + rope，`MLAAttentionSpec`）
 - Index = `L_sparse × IdxD × dtype`，**key-only 无 ×2**（`MLAAttentionSpec` + `indexer.py:161`）
-- `num_blocks = available_kv // page // layers`（`kv_cache_utils.py:1009`）
-- `max_concurrency = num_blocks / blocks_per_req`（`kv_cache_utils.py:958`）
+- Draft（MTP/NextN）= `draft_layers × per_layer_main_kv`（draft 层复用主层 KV 布局，`vllm/v1/spec_decode`）
+- `num_blocks = available_kv // page // effective_layers`（`kv_cache_utils.py:1009`）；`effective_layers = L + draft_layers`（uniform）或 `max(L+draft, L_sparse)`（hybrid）
+- `max_concurrency = num_blocks / blocks_per_req`（`kv_cache_utils.py:958`）；`blocks_per_req` 含 draft 层组
 - `GPU_KV_tokens = max_concurrency × max_model_len`（`kv_cache_utils.py:1833`）
 
 ## 表格字段说明
@@ -155,7 +176,10 @@ python fill_table.py \
 
 - **Q: 没有 vllm / vllm-ascend 源码能用吗？** A: 能。公式已内置在 `vllm_ascend_memory_formulas.py`，源码锚点只是溯源标注。
 - **Q: 没装 torch / NPU 驱动能用吗？** A: 能。脚本只用 `openpyxl` + 标准库，纯计算，不调用任何 NPU / torch API。
-- **Q: 不想下载几 GB 权重怎么办？** A: 用 `--hf-model`，脚本只下 `config.json`（几 KB）。
-- **Q: 国内访问 HF 慢？** A: `set HF_ENDPOINT=https://hf-mirror.com`（PowerShell）或 `export HF_ENDPOINT=https://hf-mirror.com`（bash）。
-- **Q: 私有 / gated 模型？** A: 设置环境变量 `HF_TOKEN=<your_token>`。
+- **Q: 不想下载几 GB 权重怎么办？** A: 用 `--hf-model` / `--ms-model`，脚本只下 `config.json`（几 KB）。
+- **Q: 国内访问 HF 慢？** A: 用 `--ms-model` 直接走 ModelScope，或 `set HF_ENDPOINT=https://hf-mirror.com`（PowerShell）/ `export HF_ENDPOINT=https://hf-mirror.com`（bash）。
+- **Q: HF 不可达时？** A: `--source auto`（默认）会自动回退到 ModelScope；或直接 `--ms-model <id>`。
+- **Q: 私有 / gated 模型？** A: 设置环境变量 `HF_TOKEN` 或 `MODELSCOPE_API_TOKEN`。
 - **Q: 拉起命令里没写 --max-model-len？** A: 脚本自动回退到 `config.max_position_embeddings` / `seq_length`。
+- **Q: 支持 DeepSeek MLA / Qwen3-MoE / MiniMax-M3 吗？** A: 支持。脚本自动识别 `model_type` 并归一化 MoE / MLA / sparse / MTP 字段差异（见上表）。
+- **Q: CurrentKV 是负数？** A: 表示该配置在指定 HBM 上放不下（OOM），需提高 TP / 上 W8A8 量化 / 换更大 HBM。这是正确信号，不是 bug。

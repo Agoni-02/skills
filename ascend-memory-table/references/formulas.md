@@ -78,12 +78,36 @@
 | 39 | 权重 (GiB) | 同行 24 | `worker.py` |
 | 40 | 激活占用显存汇总 (GiB) | 同行 25 | `worker.py` |
 | 41 | 可用KV Cache (GiB) | 同行 29（Current KV） | `worker.py:581` |
-| 42 | 单个token占用的kv cache (MiB) | `per_token_main = L × 2 × Hkv_local × D × dtype`，其中 **`Hkv_local = max(1, Hkv // TP)`** | `kv_cache_interface.py:212 AttentionSpec.real_page_size_bytes` / block_size；MiniMax TP 切分 |
-| 43 | 单个token占用的index cache (MiB) | `per_token_index = L_sparse × 1 × IdxD × dtype`（**key-only，无 ×2**） | `kv_cache_interface.py:411 MLAAttentionSpec.real_page_size_bytes`；`minimax_m3/common/indexer.py:161 MLAAttentionSpec(num_kv_heads=1)` |
-| 44 | 单个token占用的draft kv cache (MiB) | MTP/EAGLE draft 层 KV；无 MTP 权重 / 未开 speculative = 0 | `vllm/v1/spec_decode/...` |
+| 42 | 单个token占用的kv cache (MiB) | **GQA**：`L × 2 × Hkv_local × D × dtype`，`Hkv_local = max(1, Hkv//TP)`；**MLA(DeepSeek)**：`L × (kv_lora_rank + qk_rope_head_dim) × dtype`（无 ×2） | `kv_cache_interface.py:212 AttentionSpec.real_page_size_bytes` / `MLAAttentionSpec` |
+| 43 | 单个token占用的index cache (MiB) | `L_sparse × 1 × IdxD × dtype`（**key-only，无 ×2**） | `kv_cache_interface.py:411 MLAAttentionSpec`；`minimax_m3/common/indexer.py:161` |
+| 44 | 单个token占用的draft kv cache (MiB) | `draft_layers × per_layer_main_kv`（MTP/NextN/EAGLE draft 层复用主层 KV 布局）；无 draft → 0 | `vllm/v1/spec_decode/...` |
 | 45 | 单个token合计cache (MiB) | `main + index + draft`（每卡口径，已含 TP 分片） | 推导 |
 | 46 | KV Cache 可容纳token数（日志块口径） | `max_concurrency × max_model_len`（= 行 34） | `kv_cache_utils.py:1833`；日志 `GPU KV cache size: %s tokens` |
 | 47 | 最大并发（KV容量理论） | `max_concurrency = num_blocks / blocks_per_req`；按平均长度 B：`(available_kv / sum_bytes_per_token) / B` | `kv_cache_utils.py:958` |
+
+---
+
+## D2. MLA（DeepSeek-V2/V3）KV 布局
+
+DeepSeek 的 Multi-head Latent Attention 把 K/V 压缩到低秩 latent，KV cache 只存压缩向量 + rope 部分，**与 num_kv_heads 解耦**：
+
+- 每层每 token KV bytes = `(kv_lora_rank + qk_rope_head_dim) × dtype`（**无 ×2**，K/V 由同一 latent 重建）
+- `main_page_size = block_size × (kv_lora_rank + qk_rope_head_dim) × dtype`
+- 检测条件：`config.json` 同时含 `kv_lora_rank` 与 `q_lora_rank`
+- 字段：`kv_lora_rank`、`qk_rope_head_dim`、`qk_nope_head_dim`、`v_head_dim`、`q_lora_rank`（后两者用于权重估算的 q_a/q_b/kv_a/kv_b 投影）
+
+权重估算（MLA 每层）= `H·q_lora + q_lora·n_h·(qk_nope+qk_rope) + H·(kv_lora+qk_rope) + kv_lora·n_h·v_head + n_h·v_head·H`
+
+---
+
+## D3. Draft / MTP / NextN 层
+
+MiniMax-M3（`num_mtp_modules`）、DeepSeek-V3（`num_nextn_predict_layers`）等带推测解码 draft 层：
+
+- draft 层复用主层 KV 布局（GQA 或 MLA），每层每 token KV = `per_layer_main_kv`
+- `effective_main_layers = L + draft_layers`（uniform）/ `max(L+draft, L_sparse)`（hybrid）
+- `blocks_per_req` 增加 `draft_layers × cdiv(max_model_len, block_size)`
+- 行 44 单独展示 draft 部分，行 45 合计含 draft
 
 ---
 
@@ -116,3 +140,25 @@
   - `Available KV cache memory: ... GiB` → 行 29
   - `... for weights, ... for peak activation, ... for non-torch memory, ... for NPU graph memory` → 行 24/25/27/28
   - `GPU KV cache size: ... tokens` / `Maximum concurrency for ... tokens per request: ...x` → 行 34/35
+
+---
+
+## H. 各模型系列 config.json 字段归一化（HuggingFace / ModelScope 实测）
+
+不同模型系列 `config.json` 字段名差异由 `arch_from_config` 自动归一化，无需用户干预：
+
+| 含义 | MiniMax-M3 | Qwen3-MoE | DeepSeek-V2/V3 | Dense(Llama等) |
+|------|------------|-----------|----------------|----------------|
+| 专家数 | `num_local_experts` | `num_experts` | `n_routed_experts` | — |
+| 每专家 intermediate | `intermediate_size` | `moe_intermediate_size` | `moe_intermediate_size` | — |
+| 稠密层 intermediate | `dense_intermediate_size` | `intermediate_size` | `intermediate_size` | `intermediate_size` |
+| shared expert | `n_shared_experts` + `shared_intermediate_size` | 无 | `n_shared_experts`（用 `moe_intermediate_size`） | — |
+| 稠密层数 | `moe_layer_freq[list]` 中 0 的个数 | `mlp_only_layers` / `decoder_sparse_step` | `first_k_dense_replace` | 全部 |
+| head_dim | `head_dim` | `head_dim` | 无（`qk_nope+qk_rope` / `v_head_dim`） | `head_dim` |
+| 注意类型 | GQA + sparse index | GQA | **MLA**（`kv_lora_rank`+`qk_rope_head_dim`） | GQA |
+| draft 层 | `num_mtp_modules` | 无 | `num_nextn_predict_layers` | 无 |
+
+下载源：
+- HuggingFace：`https://huggingface.co/<id>/resolve/<rev>/config.json`（镜像 `HF_ENDPOINT=https://hf-mirror.com`）
+- ModelScope：`https://modelscope.cn/api/v1/models/<id>/repo?Revision=<rev>&FilePath=config.json`
+- `--source auto`（默认）：先 HF 后 ModelScope 自动回退；`--ms-model` 强制 ModelScope

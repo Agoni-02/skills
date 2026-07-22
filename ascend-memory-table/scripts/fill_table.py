@@ -40,56 +40,102 @@ WARN = PatternFill("solid", fgColor="FCE8E6")
 MEAS = PatternFill("solid", fgColor="D6EAF8")  # measured (from log)
 
 
-# ---------- HuggingFace config.json auto-download ----------
-# Resolves a HF model id (e.g. "MiniMaxAI/MiniMax-M3") or HF URL to a local
-# config.json path. Downloads ONLY config.json (a few KB), never weights.
-# Falls back through text_config variants for VL models. No huggingface_hub
-# dependency required — uses plain urllib so the skill stays self-contained.
+# ---------- HuggingFace / ModelScope config.json auto-download ----------
+# Resolves a model id (e.g. "MiniMaxAI/MiniMax-M3") or URL to a local config.json.
+# Downloads ONLY config.json (a few KB), never weights.
+# Sources (auto-fallback HF → ModelScope when HF unreachable):
+#   - HuggingFace:  https://huggingface.co/<id>/resolve/<rev>/config.json
+#   - ModelScope:   https://modelscope.cn/api/v1/models/<id>/repo?Revision=<rev>&FilePath=config.json
+# Uses plain urllib (no huggingface_hub / modelscope SDK) so the skill stays self-contained.
 HF_ENDPOINT = os.environ.get("HF_ENDPOINT", "https://huggingface.co")
 HF_TOKEN = os.environ.get("HF_TOKEN") or os.environ.get("HUGGING_FACE_HUB_TOKEN")
+MS_ENDPOINT = os.environ.get("MODELSCOPE_ENDPOINT", "https://modelscope.cn")
 
 
 def _hf_resolve_id(s: str) -> str:
-    """Accept 'owner/name', 'owner/name/revision', or a full HF URL; return 'owner/name' (+ optional revision)."""
+    """Accept 'owner/name', 'owner/name/revision', or a full HF URL; return 'owner/name' (+ optional @revision)."""
     s = s.strip()
     if s.startswith(("http://", "https://")):
-        # https://huggingface.co/owner/name[/resolve/main/config.json][/tree/main]
         m = re.match(r"https?://[^/]+/([^/]+/[^/?#]+)(?:/(?:resolve|blob|tree)/([^/?#]+))?", s)
         if m:
             return m.group(1) + (f"@{m.group(2)}" if m.group(2) else "")
     return s
 
 
+def _http_get(url: str, headers: dict, timeout: int = 30) -> bytes:
+    req = Request(url, headers=headers)
+    with urlopen(req, timeout=timeout) as r:
+        return r.read()
+
+
+def _save_config(data: bytes, out: Path) -> None:
+    try:
+        json.loads(data)  # validate
+    except json.JSONDecodeError:
+        raise ValueError(f"downloaded content is not valid JSON")
+    out.write_bytes(data)
+
+
 def _hf_download_config(model_id: str, dest_dir: Path) -> Path:
-    """Download config.json for a HF model id into dest_dir; return local path."""
+    """Download config.json from HuggingFace into dest_dir; return local path. Raises on failure."""
     dest_dir.mkdir(parents=True, exist_ok=True)
     safe = model_id.replace("/", "_").replace("@", "_rev_")
-    out = dest_dir / f"{safe}__config.json"
+    out = dest_dir / f"{safe}__hf__config.json"
     if out.exists() and out.stat().st_size > 0:
-        return out  # cache
+        return out
     mid, _, rev = model_id.partition("@")
     rev = rev or "main"
     url = f"{HF_ENDPOINT}/{mid}/resolve/{rev}/config.json"
     headers = {"User-Agent": "ascend-memory-table/1.0"}
     if HF_TOKEN:
         headers["Authorization"] = f"Bearer {HF_TOKEN}"
-    req = Request(url, headers=headers)
-    try:
-        with urlopen(req, timeout=30) as r:
-            data = r.read()
-    except URLError as e:
-        sys.exit(
-            f"[fill_table] 下载 config.json 失败: {url}\n"
-            f"  原因: {e}\n"
-            f"  排查: 1) 模型 id 是否正确 2) 是否需要登录(设置 HF_TOKEN 环境变量) "
-            f"3) 私有/ gated 仓库需先 huggingface-cli login 4) 国内可设 HF_ENDPOINT=https://hf-mirror.com"
-        )
-    try:
-        json.loads(data)  # validate
-    except json.JSONDecodeError:
-        sys.exit(f"[fill_table] 下载的内容不是合法 JSON: {url}")
-    out.write_bytes(data)
+    data = _http_get(url, headers)
+    _save_config(data, out)
     return out
+
+
+def _ms_download_config(model_id: str, dest_dir: Path) -> Path:
+    """Download config.json from ModelScope into dest_dir; return local path. Raises on failure."""
+    dest_dir.mkdir(parents=True, exist_ok=True)
+    safe = model_id.replace("/", "_").replace("@", "_rev_")
+    out = dest_dir / f"{safe}__ms__config.json"
+    if out.exists() and out.stat().st_size > 0:
+        return out
+    mid, _, rev = model_id.partition("@")
+    rev = rev or "master"
+    url = f"{MS_ENDPOINT}/api/v1/models/{mid}/repo?Revision={rev}&FilePath=config.json"
+    headers = {"User-Agent": "ascend-memory-table/1.0"}
+    data = _http_get(url, headers)
+    _save_config(data, out)
+    return out
+
+
+def download_config(model_id: str, dest_dir: Path, source: str = "auto") -> tuple[Path, str]:
+    """
+    Download config.json for a model id. Returns (local_path, source_used).
+    source: 'hf' | 'ms' | 'auto' (auto tries HF first, falls back to ModelScope).
+    """
+    mid = _hf_resolve_id(model_id)
+    errors = []
+    order = []
+    if source in ("auto", "hf"):
+        order.append("hf")
+    if source in ("auto", "ms"):
+        order.append("ms")
+    for src in order:
+        try:
+            if src == "hf":
+                return _hf_download_config(mid, dest_dir), "hf"
+            else:
+                return _ms_download_config(mid, dest_dir), "ms"
+        except Exception as e:
+            errors.append(f"{src}: {e}")
+    sys.exit(
+        f"[fill_table] 下载 config.json 失败（已尝试 {', '.join(order)}）: model_id={mid}\n"
+        f"  错误: {'; '.join(errors)}\n"
+        f"  排查: 1) 模型 id 是否正确 2) 私有/gated 仓库需设 HF_TOKEN / MODELSCOPE_API_TOKEN "
+        f"3) 国内可设 HF_ENDPOINT=https://hf-mirror.com 或用 --source ms 4) 网络代理"
+    )
 
 
 # ---------- serve command parsing ----------
@@ -136,53 +182,145 @@ def load_config(path: Path) -> dict:
 
 
 def arch_from_config(cfg: dict) -> dict:
+    """
+    Family-aware architecture extraction. Normalizes field-name differences across
+    HuggingFace/ModelScope config.json formats so the rest of the skill is family-agnostic.
+
+    Supported families (verified against upstream config.json):
+      - MiniMax-M3 (minimax_m3_vl): sparse_attention_config, num_local_experts,
+        dense_intermediate_size, shared_intermediate_size, moe_layer_freq[list], MTP
+      - Qwen3-MoE (qwen3_moe): num_experts, moe_intermediate_size, decoder_sparse_step,
+        mlp_only_layers, no shared experts, no sparse index
+      - DeepSeek-V2/V3 (deepseek_v2/v3): MLA (kv_lora_rank/qk_rope_head_dim),
+        n_routed_experts, n_shared_experts, moe_intermediate_size, first_k_dense_replace
+      - Dense Llama/Qwen2/GLM/etc.: no MoE, standard GQA
+    """
     tc = cfg["text"]
-    sac = tc.get("sparse_attention_config", {}) or {}
-    moe_freq = tc.get("moe_layer_freq", [])
-    sparse_freq = sac.get("sparse_attention_freq", [])
+    model_type = tc.get("model_type", "") or cfg.get("raw", {}).get("model_type", "") or ""
     L = tc["num_hidden_layers"]
+    n_heads = tc["num_attention_heads"]
+    Hkv = tc.get("num_key_value_heads", n_heads)  # MHA fallback
+    H = tc["hidden_size"]
+    vocab = tc["vocab_size"]
+    tie = tc.get("tie_word_embeddings", False)
+
+    # ---- head_dim: present for Qwen3/MiniMax; derived for DeepSeek MLA ----
+    D = tc.get("head_dim")
+    if D is None:
+        # DeepSeek MLA: no head_dim; Q head = qk_nope+qk_rope, V head = v_head_dim.
+        # For GQA-style per-token KV we don't use D under MLA (uses kv_lora_rank),
+        # but keep a representative value for reporting / non-MLA fallback.
+        D = (tc.get("qk_nope_head_dim", 0) + tc.get("qk_rope_head_dim", 0)) or tc.get("v_head_dim", 0) or 128
+
+    # ---- MLA detection (DeepSeek-V2/V3) ----
+    is_mla = "kv_lora_rank" in tc and "q_lora_rank" in tc
+    kv_lora_rank = tc.get("kv_lora_rank", 0) or 0
+    qk_rope_head_dim = tc.get("qk_rope_head_dim", 0) or 0
+    qk_nope_head_dim = tc.get("qk_nope_head_dim", 0) or 0
+    v_head_dim = tc.get("v_head_dim", 0) or 0
+    q_lora_rank = tc.get("q_lora_rank", 0) or 0
+
+    # ---- MoE experts: num_experts (Qwen3) / num_local_experts (MiniMax) / n_routed_experts (DeepSeek) ----
+    num_experts = (tc.get("num_experts") or tc.get("num_local_experts")
+                  or tc.get("n_routed_experts") or 0)
+    num_experts_per_tok = tc.get("num_experts_per_tok", 0) or 0
+
+    # ---- per-expert intermediate: moe_intermediate_size (Qwen3/DeepSeek) / intermediate_size (MiniMax routed) ----
+    moe_intermediate = tc.get("moe_intermediate_size", 0) or 0
+    routed_intermediate = moe_intermediate or tc.get("intermediate_size", 0) or 0
+
+    # ---- dense (non-MoE) layer intermediate ----
+    dense_intermediate = (tc.get("dense_intermediate_size", 0)  # MiniMax
+                         or (tc.get("intermediate_size", 0) if not moe_intermediate else 0)  # dense-only models
+                         or 0)
+
+    # ---- shared experts (DeepSeek/MiniMax) ----
+    n_shared = tc.get("n_shared_experts", 0) or 0
+    shared_intermediate = (tc.get("shared_intermediate_size", 0)  # MiniMax
+                           or moe_intermediate  # DeepSeek shared uses moe_intermediate_size
+                           or 0)
+
+    # ---- n_dense (first dense, rest MoE) ----
+    if "first_k_dense_replace" in tc:                      # DeepSeek
+        n_dense = int(tc["first_k_dense_replace"])
+    elif isinstance(tc.get("moe_layer_freq"), list):       # MiniMax: list of 0/1
+        freq = tc["moe_layer_freq"]
+        n_dense = sum(1 for x in freq if x == 0) if freq else 0
+    elif isinstance(tc.get("moe_layer_freq"), int):       # DeepSeek: every N-th layer MoE
+        n_dense = 0 if tc["moe_layer_freq"] == 1 else (L // max(1, tc["moe_layer_freq"]))
+    elif isinstance(tc.get("mlp_only_layers"), list) and tc.get("mlp_only_layers"):
+        n_dense = len(tc["mlp_only_layers"])               # Qwen3: explicit dense-only list
+    elif "decoder_sparse_step" in tc:
+        n_dense = 0 if int(tc["decoder_sparse_step"]) == 1 else 0  # Qwen3: step=1 → all MoE
+    else:
+        n_dense = L if num_experts == 0 else 0             # dense model: all dense
+    n_moe = L - n_dense
+
+    # ---- sparse / index attention (MiniMax-M3) ----
+    sac = tc.get("sparse_attention_config", {}) or {}
+    sparse_freq = sac.get("sparse_attention_freq", [])
     L_sparse = sum(1 for x in sparse_freq if x == 1) if sparse_freq else 0
+    IdxD = sac.get("sparse_index_dim", 0) or 0
+    idx_heads = sac.get("sparse_num_index_heads", 0) or 0
+
+    # ---- MTP / draft layers (MiniMax-M3 num_mtp_modules; DeepSeek-V3 num_nextn_predict_layers) ----
+    draft_layers = (tc.get("num_mtp_modules", 0) or tc.get("num_nextn_predict_layers", 0) or 0)
+
     return {
         "L": L, "L_sparse": L_sparse,
-        "Hkv": tc["num_key_value_heads"],
-        "n_heads": tc["num_attention_heads"],
-        "D": tc["head_dim"],
-        "IdxD": sac.get("sparse_index_dim", 0) or 0,
-        "hidden_size": tc["hidden_size"],
-        "num_experts": tc.get("num_local_experts", 0) or 0,
-        "num_experts_per_tok": tc.get("num_experts_per_tok", 0) or 0,
-        "vocab_size": tc["vocab_size"],
-        "tie": tc.get("tie_word_embeddings", False),
-        "dense_intermediate_size": tc.get("dense_intermediate_size", tc.get("intermediate_size", 0)),
-        "intermediate_size": tc.get("intermediate_size", 0),
-        "shared_intermediate_size": tc.get("shared_intermediate_size", 0),
-        "n_shared_experts": tc.get("n_shared_experts", 0) or 0,
-        "idx_heads": sac.get("sparse_num_index_heads", 0) or 0,
+        "n_heads": n_heads, "Hkv": Hkv, "D": D, "hidden_size": H,
+        "vocab_size": vocab, "tie": tie,
+        "is_mla": is_mla,
+        "kv_lora_rank": kv_lora_rank, "qk_rope_head_dim": qk_rope_head_dim,
+        "qk_nope_head_dim": qk_nope_head_dim, "v_head_dim": v_head_dim, "q_lora_rank": q_lora_rank,
+        "num_experts": num_experts, "num_experts_per_tok": num_experts_per_tok,
+        "n_dense": n_dense, "n_moe": n_moe,
+        "routed_intermediate": routed_intermediate,
+        "dense_intermediate": dense_intermediate,
+        "n_shared_experts": n_shared, "shared_intermediate": shared_intermediate,
+        "IdxD": IdxD, "idx_heads": idx_heads,
+        "draft_layers": draft_layers,
+        "model_type": model_type,
         "has_vision": cfg["vision"] is not None,
     }
 
 
 def estimate_weights(a: dict, tp: int, ep: int, quant: str) -> dict:
-    """W8A8 text-only weight breakdown (GiB). Returns dict with 'weight' total."""
+    """
+    W8A8/BF16 per-card weight breakdown (GiB). Family-aware:
+      - MLA (DeepSeek): q_a/q_b/kv_a/kv_b/o projections via lora ranks
+      - GQA (Qwen3/MiniMax/Llama): q/k/v/o via n_h*D / n_kv*D
+      - MoE: routed experts /EP, shared experts /TP, gate fp32, dense MLP /TP
+      - MiniMax indexer: sparse index projections /TP
+    Embeddings stay BF16 (*2); linear weights use `b` (1 for W8A8, 2 for BF16).
+    """
     H = a["hidden_size"]; vocab = a["vocab_size"]; L = a["L"]
     n_h = a["n_heads"]; n_kv = a["Hkv"]; D = a["D"]
-    I_dense = a["dense_intermediate_size"]; I_moe = a["intermediate_size"]
-    I_shared = a["shared_intermediate_size"]; E = a["num_experts"]
-    n_shared = a["n_shared_experts"]; idx_heads = a["idx_heads"]; idx_dim = a["IdxD"]
-    moe_freq = [1] * L  # default all-MoE; refined below if known
-    # rough: if dense_intermediate given, assume first few layers dense
-    n_dense = 0; n_moe = L; n_sparse = a["L_sparse"]
-    if I_dense and I_dense != I_moe:
-        n_dense = 3; n_moe = L - n_dense  # common pattern; refine from moe_layer_freq if available
+    E = a["num_experts"]; n_shared = a["n_shared_experts"]
+    n_dense = a["n_dense"]; n_moe = a["n_moe"]; n_sparse = a["L_sparse"]
+    I_dense = a["dense_intermediate"]; I_routed = a["routed_intermediate"]
+    I_shared = a["shared_intermediate"]; idx_heads = a["idx_heads"]; idx_dim = a["IdxD"]
 
     emb = vocab * H; lm = 0 if a["tie"] else vocab * H
-    attn = H * (n_h * D) + H * (n_kv * D) * 2 + (n_h * D) * H
-    qk_norm = (n_h + n_kv) * D
+
+    # ---- attention per layer ----
+    if a["is_mla"]:
+        kv_lora = a["kv_lora_rank"]; q_lora = a["q_lora_rank"]
+        qk_nope = a["qk_nope_head_dim"]; qk_rope = a["qk_rope_head_dim"]; v_h = a["v_head_dim"]
+        # MLA: q_a(H*q_lora)+q_norm + q_b(q_lora*n_h*(qk_nope+qk_rope))
+        #      kv_a(H*(kv_lora+qk_rope))+kv_norm + kv_b(kv_lora*n_h*v_h) + o(n_h*v_h*H)
+        attn = (H * q_lora + q_lora * n_h * (qk_nope + qk_rope)
+                + H * (kv_lora + qk_rope) + kv_lora * n_h * v_h + n_h * v_h * H)
+        qk_norm = (q_lora + kv_lora + qk_rope)  # MLA norm dims (small)
+    else:
+        attn = H * (n_h * D) + H * (n_kv * D) * 2 + (n_h * D) * H  # q + (k+v) + o
+        qk_norm = (n_h + n_kv) * D
+
     rms = (2 * L + 1) * H
     indexer = (H * idx_heads * idx_dim + H * idx_dim + (idx_heads + 1) * idx_dim) if idx_dim else 0
     dense_mlp = 3 * H * I_dense if I_dense else 0
-    shared = n_shared * 3 * H * I_shared if I_shared else 0
-    routed = E * 3 * H * I_moe if I_moe else 0
+    shared = n_shared * 3 * H * I_shared if (n_shared and I_shared) else 0
+    routed = E * 3 * H * I_routed if (E and I_routed) else 0
     gate = (H * E + E) if E else 0
 
     b = 1.0 if (quant and quant.lower() in ("ascend", "w8a8")) else 2.0
@@ -288,20 +426,25 @@ def fill_xlsx(template_path: Path, out_path: Path, model_name: str, a: dict,
     put(30, fit_req, wfill); put(31, full_free, wfill); put(32, num_blocks, wfill)
     put(33, layout.block_size); put(34, gpu_tokens, wfill); put(35, round(max_conc, 4), wfill)
     put(39, w_gib); put(40, act_gib); put(41, cur_kv); put(42, kv_mib)
-    put(43, idx_mib); put(44, 0); put(45, sum_mib); put(46, gpu_tokens)
+    put(43, idx_mib); put(44, round(layout.draft_bytes_per_token / MiB, 6)); put(45, sum_mib); put(46, gpu_tokens)
     put(47, round(cur_kv * GiB / (layout.sum_bytes_per_token * B), 3) if layout.sum_bytes_per_token else 0)
 
     # 仅向含动态数值的行追加具体数字到 C 列
-    app_c(9, f" → Hkv_local={Hkv_local}=max(1,{a['Hkv']}//{deploy['TP']})")
+    app_c(9, f" → Hkv_local={Hkv_local}=max(1,{a['Hkv']}//{deploy['TP']})" + (" [MLA: Hkv unused]" if a["is_mla"] else ""))
     app_c(16, f"={a['num_experts']}/{deploy['EP']}")
     app_c(21, f"={deploy['TP']}×{deploy['DP']}")
     app_c(24, f" → 理论W8A8={wbk['weight']}")
-    app_c(32, f" → 本例{'hybrid' if hybrid else 'uniform'}")
+    app_c(32, f" → 本例{'hybrid' if hybrid else 'uniform'}" + (f" +{a['draft_layers']} draft" if a["draft_layers"] else ""))
     app_c(35, f"={num_blocks}/{blocks_per_req}")
     app_c(39, " → " + "+".join(f"{k}={v}" for k, v in wbk.items() if k != "weight") + f"={wbk['weight']}")
     app_c(41, f"={round(budget.requested_bytes()/GiB,3)}−W−act−non_torch={cur_kv}")
-    app_c(42, f"={a['L']}×2×{Hkv_local}×{a['D']}×{layout.bytes_per_elem}")
+    if a["is_mla"]:
+        app_c(42, f"=L×(kv_lora_rank+qk_rope_head_dim)×dtype = {a['L']}×({a['kv_lora_rank']}+{a['qk_rope_head_dim']})×{layout.bytes_per_elem}  [MLA, no ×2]")
+    else:
+        app_c(42, f"={a['L']}×2×{Hkv_local}×{a['D']}×{layout.bytes_per_elem}")
     app_c(43, f"={a['L_sparse']}×1×{a['IdxD']}×{layout.bytes_per_elem}" if a["IdxD"] else " → 无indexer→0")
+    if a["draft_layers"]:
+        app_c(44, f"={a['draft_layers']}×per_layer_main_kv (MTP/NextN draft)")
     app_c(46, f"={round(max_conc,4)}×{deploy['max_model_len']}")
     app_c(47, f"={cur_kv}/{sum_mib}/{B}")
 
@@ -328,22 +471,31 @@ def main():
   python fill_table.py --hf-model MiniMaxAI/MiniMax-M3 \\
     --serve "vllm serve MiniMaxAI/MiniMax-M3 --tensor-parallel-size 8 --gpu-memory-utilization 0.9 --max-model-len 65536 --quantization ascend --enable-expert-parallel"
 
-  # 2) 本地 config.json
+  # 2) 从 ModelScope 下载（国内更快；或 HF 不可达时自动回退到 ModelScope）
+  python fill_table.py --ms-model Qwen/Qwen3-235B-A22B --serve "vllm serve ..."
+
+  # 3) 本地 config.json
   python fill_table.py --config /path/to/config.json --serve "vllm serve ..." --hbm 96
 
-  # 3) 只算不写表（dry-run，快速看结果）
+  # 4) 只算不写表（dry-run，快速看结果）
   python fill_table.py --hf-model Qwen/Qwen3-235B-A22B --serve "..." --dry-run
 
-  # 4) 带 warmup 日志（实测值覆盖理论占位）
+  # 5) 带 warmup 日志（实测值覆盖理论占位）
   python fill_table.py --config config.json --serve "..." --warmup-log vllm.log
+
+  # 6) 强制数据源：--source hf|ms|auto（默认 auto：先 HF 后 ModelScope）
+  python fill_table.py --hf-model deepseek-ai/DeepSeek-V3 --source ms --serve "..."
 """,
     )
-    src = ap.add_argument_group("模型来源（三选一）")
+    src = ap.add_argument_group("模型来源（四选一）")
     src.add_argument("--hf-model", help="HuggingFace model id 或 URL（如 MiniMaxAI/MiniMax-M3）；自动下载 config.json，无需权重")
+    src.add_argument("--ms-model", help="ModelScope model id 或 URL（如 Qwen/Qwen3-235B-A22B）；国内推荐")
     src.add_argument("--config", help="本地 config.json 路径")
     src.add_argument("--config-dir", help="含 config.json 的模型目录")
+    src.add_argument("--source", choices=["auto", "hf", "ms"], default="auto",
+                     help="config.json 下载源：auto=先 HF 后 ModelScope（默认）；hf=仅 HF；ms=仅 ModelScope")
     ap.add_argument("--serve", required=True, help="vllm serve / api_server 拉起命令字符串")
-    ap.add_argument("--model-name", default="", help="表格中显示的模型名（不给则用 HF id / 目录名）")
+    ap.add_argument("--model-name", default="", help="表格中显示的模型名（不给则用 model id / 目录名）")
     ap.add_argument("--hbm", type=float, default=64.0, help="单卡 HBM GiB（默认 64；可选 80/96）")
     ap.add_argument("--B", type=int, default=8192, help="平均请求长度（输入+输出 tokens，默认 8192）")
     ap.add_argument("--non-torch", type=float, default=3.2, help="non-torch 经验值 GiB（TP/DP 越大越大，默认 3.2）")
@@ -355,13 +507,26 @@ def main():
     args = ap.parse_args()
 
     # ---- resolve config.json source ----
-    if not args.hf_model and not args.config and not args.config_dir:
-        sys.exit("[fill_table] 必须提供模型来源之一：--hf-model / --config / --config-dir")
+    if not args.hf_model and not args.ms_model and not args.config and not args.config_dir:
+        sys.exit("[fill_table] 必须提供模型来源之一：--hf-model / --ms-model / --config / --config-dir")
 
-    if args.hf_model:
-        model_id = _hf_resolve_id(args.hf_model)
+    if args.hf_model or args.ms_model:
+        raw_id = args.hf_model or args.ms_model
+        model_id = _hf_resolve_id(raw_id)
+        # --ms-model forces ms; --hf-model forces hf; --source overrides
+        if args.ms_model:
+            source = "ms"
+        elif args.hf_model:
+            source = "hf" if args.source == "auto" else args.source
+        else:
+            source = args.source
+        # for --hf-model with --source auto, allow fallback to ms
+        if args.hf_model and args.source == "auto":
+            source = "auto"
         tmp_dir = Path(tempfile.gettempdir()) / "ascend-mem-table"
-        cfg_path = _hf_download_config(model_id, tmp_dir)
+        cfg_path, used = download_config(model_id, tmp_dir, source=source)
+        if used == "ms":
+            print(f"[fill_table] config.json 来自 ModelScope（HF 不可达或 --source ms）")
         default_name = model_id.split("@", 1)[0].split("/", 1)[-1]
     else:
         cfg_path = Path(args.config) if args.config else Path(args.config_dir) / "config.json"
@@ -390,7 +555,12 @@ def main():
     act_b = estimate_peak_activation_bytes(T, a["hidden_size"], n_h_local, a["D"], a["num_experts_per_tok"], deploy["EP"])
     bpe = 1 if (deploy.get("kv_cache_dtype") and "8" in str(deploy["kv_cache_dtype"]).lower()) else 2
     budget = MemoryBudget(args.hbm, deploy["util"], wbk["weight"], act_b / GiB, args.non_torch, args.graph, args.hbm)
-    layout = KVLayout(a["L"], a["L_sparse"], a["Hkv"], Hkv_local, a["D"], a["IdxD"], bpe, deploy["block_size"], deploy["TP"])
+    layout = KVLayout(
+        a["L"], a["L_sparse"], a["Hkv"], Hkv_local, a["D"], a["IdxD"], bpe,
+        deploy["block_size"], deploy["TP"],
+        is_mla=a["is_mla"], kv_lora_rank=a["kv_lora_rank"], qk_rope_head_dim=a["qk_rope_head_dim"],
+        draft_layers=a["draft_layers"],
+    )
     hybrid = a["L_sparse"] > 0
     avail = budget.available_kv_bytes()
     num_blocks = layout.num_blocks_hybrid_m3(avail) if hybrid else layout.num_blocks_uniform(avail)
@@ -411,19 +581,25 @@ def main():
             max_conc = measured["max_concurrency"]
 
     cur_kv = round(budget.current_kv_gib(), 3)
-    print(f"模型: {name}")
+    print(f"模型: {name}  (model_type={a['model_type'] or 'unknown'}"
+          + (" MLA" if a["is_mla"] else "") + (" MTP" if a["draft_layers"] else "") + ")")
     print(f"  L={a['L']} L_sparse={a['L_sparse']} Hkv={a['Hkv']} D={a['D']} IdxD={a['IdxD']} "
-          f"hidden={a['hidden_size']} experts={a['num_experts']} topk={a['num_experts_per_tok']}")
+          f"hidden={a['hidden_size']} experts={a['num_experts']} topk={a['num_experts_per_tok']} "
+          f"n_dense={a['n_dense']} n_moe={a['n_moe']} n_shared={a['n_shared_experts']} draft={a['draft_layers']}"
+          + (f" kv_lora={a['kv_lora_rank']} qk_rope={a['qk_rope_head_dim']}" if a["is_mla"] else ""))
     print(f"  部署: TP={deploy['TP']} DP={deploy['DP']} EP={deploy['EP']} util={deploy['util']} "
           f"max_model_len={deploy['max_model_len']} block_size={deploy['block_size']} quant={quant or 'BF16'} kv_dtype_bpe={bpe}")
-    print(f"  Hkv_local=max(1,{a['Hkv']}//{deploy['TP']})={Hkv_local}")
-    print(f"  W8A8权重分项: " + " ".join(f"{k}={v}" for k, v in wbk.items() if k != "weight"))
+    if a["is_mla"]:
+        print(f"  [MLA] per-layer KV = (kv_lora_rank+qk_rope_head_dim)×dtype = ({a['kv_lora_rank']}+{a['qk_rope_head_dim']})×{bpe}")
+    else:
+        print(f"  Hkv_local=max(1,{a['Hkv']}//{deploy['TP']})={Hkv_local}")
+    print(f"  权重分项: " + " ".join(f"{k}={v}" for k, v in wbk.items() if k != "weight"))
     print(f"  W={wbk['weight']}GiB  peak_act={act_b/GiB:.3f}GiB  non_torch={args.non_torch}GiB  graph={args.graph}GiB")
     print(f"  requested={budget.requested_bytes()/GiB:.3f}GiB  CurrentKV={cur_kv}GiB  "
           f"num_blocks={num_blocks}  blocks_per_req={blocks_per_req}")
     print(f"  GPU_KV_tokens={gpu_tokens}  满长并发={max_conc:.4f}  "
           f"单token合计={layout.sum_bytes_per_token/MiB:.6f}MiB "
-          f"(main={layout.main_bytes_per_token/MiB:.6f} index={layout.index_bytes_per_token/MiB:.6f})")
+          f"(main={layout.main_bytes_per_token/MiB:.6f} index={layout.index_bytes_per_token/MiB:.6f} draft={layout.draft_bytes_per_token/MiB:.6f})")
     if measured:
         print(f"  [实测] 已用 warmup 日志覆盖: {list(measured.keys())}")
     else:

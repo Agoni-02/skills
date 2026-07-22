@@ -94,7 +94,7 @@ class MemoryBudget:
 
 @dataclass
 class KVLayout:
-    """Per-rank KV layout after TP."""
+    """Per-rank KV layout after TP. Supports GQA, MLA (DeepSeek), MiniMax-M3 hybrid index, and MTP draft layers."""
 
     L: int
     L_sparse: int
@@ -105,11 +105,33 @@ class KVLayout:
     bytes_per_elem: int
     block_size: int
     tp: int
+    # MLA (DeepSeek-V2/V3): KV cache stores compressed latent (kv_lora_rank) + rope (qk_rope_head_dim), no ×2
+    is_mla: bool = False
+    kv_lora_rank: int = 0
+    qk_rope_head_dim: int = 0
+    # MTP / EAGLE draft layers (each draft layer reuses the main per-layer KV layout)
+    draft_layers: int = 0
+
+    @property
+    def per_layer_main_bytes(self) -> int:
+        """Per-token bytes of one full-attention layer (GQA: 2*KV*H*D; MLA: latent+rope, no ×2)."""
+        if self.is_mla:
+            return (self.kv_lora_rank + self.qk_rope_head_dim) * self.bytes_per_elem
+        return 2 * self.Hkv_local * self.D * self.bytes_per_elem
+
+    @property
+    def effective_main_layers(self) -> int:
+        """Main full-attn layers incl. draft (draft layers reuse main layout)."""
+        return self.L + self.draft_layers
 
     @property
     def main_bytes_per_token(self) -> int:
-        # FullAttentionSpec: 2 (K+V) * Hkv_local * D * dtype * L
-        return self.L * 2 * self.Hkv_local * self.D * self.bytes_per_elem
+        # Main-model full-attn layers only (excludes draft; draft reported separately for the table).
+        return self.L * self.per_layer_main_bytes
+
+    @property
+    def draft_bytes_per_token(self) -> int:
+        return self.draft_layers * self.per_layer_main_bytes
 
     @property
     def index_bytes_per_token(self) -> int:
@@ -119,16 +141,15 @@ class KVLayout:
         return self.L_sparse * 1 * self.IdxD * self.bytes_per_elem
 
     @property
-    def draft_bytes_per_token(self) -> int:
-        return 0
-
-    @property
     def sum_bytes_per_token(self) -> int:
         return self.main_bytes_per_token + self.index_bytes_per_token + self.draft_bytes_per_token
 
     @property
     def main_page_size(self) -> int:
-        # AttentionSpec.real_page_size_bytes
+        # AttentionSpec.real_page_size_bytes (GQA: 2*block*Hkv_local*D*dtype)
+        # MLA: block * (kv_lora_rank + qk_rope_head_dim) * dtype (no ×2, compressed latent)
+        if self.is_mla:
+            return self.block_size * (self.kv_lora_rank + self.qk_rope_head_dim) * self.bytes_per_elem
         return 2 * self.block_size * self.Hkv_local * self.D * self.bytes_per_elem
 
     @property
@@ -145,25 +166,25 @@ class KVLayout:
         if idx_p <= 0:
             return self.block_size
         if main_p % idx_p != 0:
-            # fall back to padded page_size path; treat as same physical page
             return self.block_size
         return self.block_size * (main_p // idx_p)
 
     def num_blocks_uniform(self, available_bytes: int) -> int:
-        """Single-group full-attn (e.g. M2.7): get_num_blocks(L, avail, page)."""
+        """Single-group full-attn (dense / Qwen3-MoE / DeepSeek MLA): get_num_blocks(L_eff, avail, page)."""
         page = self.main_page_size
-        if page <= 0 or self.L <= 0:
+        group_size = self.effective_main_layers
+        if page <= 0 or group_size <= 0:
             return 0
-        return max(0, available_bytes // page // self.L)
+        return max(0, available_bytes // page // group_size)
 
     def num_blocks_hybrid_m3(self, available_bytes: int) -> int:
         """
-        M3: group0=L full layers, group1=L_sparse indexer layers.
+        M3 hybrid: group0 = (L + draft) full layers, group1 = L_sparse indexer layers.
         General hybrid path: group_size = max(len(g) for g in groups),
         page_size = unified main page, num_blocks = avail // page // group_size.
         """
         page = self.main_page_size
-        group_size = max(self.L, self.L_sparse if self.L_sparse else self.L)
+        group_size = max(self.effective_main_layers, self.L_sparse if self.L_sparse else self.effective_main_layers)
         if page <= 0 or group_size <= 0:
             return 0
         return max(0, available_bytes // page // group_size)
@@ -174,6 +195,7 @@ class KVLayout:
         """
         Returns (max_concurrency, gpu_kv_tokens, blocks_per_req, index_block_size).
         Mirrors get_max_concurrency_for_kv_cache_config + get_kv_cache_capacity.
+        Draft layers add their own cdiv(max_model_len, block_size) blocks per request.
         """
         if hybrid and self.L_sparse > 0:
             idx_bs = self.unify_index_block_size()
@@ -183,6 +205,9 @@ class KVLayout:
         else:
             idx_bs = self.block_size
             blocks_per_req = cdiv(max_model_len, self.block_size)
+        # draft layers: each draft layer group contributes cdiv(max_model_len, block_size)
+        if self.draft_layers > 0:
+            blocks_per_req += self.draft_layers * cdiv(max_model_len, self.block_size)
         if blocks_per_req <= 0:
             return 0.0, 0, 0, idx_bs
         max_conc = num_blocks / blocks_per_req
