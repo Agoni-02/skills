@@ -1,6 +1,6 @@
 # Huawei Ascend Skills
 
-本工程用于存放一些 Huawei Ascend NPU 相关的 Cursor Agent Skills。
+本工程用于存放一些 Huawei Ascend NPU 相关的  Agent Skills。
 
 ## 目录结构
 
